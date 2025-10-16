@@ -1297,39 +1297,39 @@ When you have successfully achieved the goal (or determined it cannot be achieve
         }
 
     except ToolLimitExceeded as e:
-        # Tool limit exceeded - mark as needs decomposition
-        logging.warning(f"[Attempt {attempt_id}] Tool limit exceeded - needs decomposition")
+        # Tool limit exceeded - report this specific outcome
+        logging.warning(f"[Attempt {attempt_id}] Tool limit exceeded")
 
         # Commit changes even if we hit the limit
         if 'worktree_path' in locals():
             final_commit_sha = git_manager.commit_worktree_changes(
                 worktree_path,
-                f"Attempt {attempt_id}: needs_decomposition (tool limit exceeded)\n\nGoal: {goal_description}"
+                f"Attempt {attempt_id}: tool_limit_exceeded\n\nGoal: {goal_description}"
             )
             if final_commit_sha:
                 logging.info(f"[Attempt {attempt_id}] Committed changes: {final_commit_sha[:8]}")
                 update_attempt_metadata(db, attempt_id, final_commit_sha=final_commit_sha)
 
-        update_attempt_outcome(db, attempt_id, "needs_decomposition", str(e))
+        update_attempt_outcome(db, attempt_id, "tool_limit_exceeded", str(e))
 
         return {
             'success': False,
             'attempt_id': attempt_id,
             'actions': actions,
-            'outcome': "needs_decomposition",
+            'outcome': "tool_limit_exceeded",
             'error': str(e)
         }
 
     except Exception as e:
-        # If something went wrong, record failure
-        logging.error(f"[Attempt {attempt_id}] Failed with exception: {e}")
+        # If something went wrong, record as error
+        logging.error(f"[Attempt {attempt_id}] Error: {e}")
 
-        # Commit changes even on failure
+        # Commit changes even on error
         if 'worktree_path' in locals():
             try:
                 final_commit_sha = git_manager.commit_worktree_changes(
                     worktree_path,
-                    f"Attempt {attempt_id}: failure\n\nGoal: {goal_description}\n\nError: {str(e)}"
+                    f"Attempt {attempt_id}: error\n\nGoal: {goal_description}\n\nError: {str(e)}"
                 )
                 if final_commit_sha:
                     logging.info(f"[Attempt {attempt_id}] Committed changes: {final_commit_sha[:8]}")
@@ -1337,13 +1337,13 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             except Exception as commit_error:
                 logging.warning(f"[Attempt {attempt_id}] Failed to commit changes: {commit_error}")
 
-        update_attempt_outcome(db, attempt_id, "failure", str(e))
+        update_attempt_outcome(db, attempt_id, "error", str(e))
 
         return {
             'success': False,
             'attempt_id': attempt_id,
             'actions': actions,
-            'outcome': "failure",
+            'outcome': "error",
             'error': str(e)
         }
 
@@ -1574,10 +1574,16 @@ def main():
 
         if result['outcome'] == 'success':
             print("✓ Goal attempt succeeded!")
-        else:
-            print("✗ Goal attempt failed")
+        elif result['outcome'] == 'tool_limit_exceeded':
+            print("⚠ Tool limit exceeded - goal may need decomposition")
+        elif result['outcome'] == 'error':
+            print("✗ Goal attempt failed with error")
             if result.get('error'):
                 print(f"Error: {result['error']}")
+        else:
+            print(f"• Goal attempt outcome: {result['outcome']}")
+            if result.get('error'):
+                print(f"Details: {result['error']}")
 
     except KeyboardInterrupt:
         print("\n\nInterrupted by user. Session saved.")
