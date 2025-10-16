@@ -963,10 +963,9 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
 
     except Exception as e:
         # If something went wrong, record failure
-        print(f"[Attempt {attempt_id or '???'}] Failed with exception: {e}")
+        print(f"[Attempt {attempt_id}] Failed with exception: {e}")
 
-        if attempt_id is not None:
-            update_attempt_outcome(db, attempt_id, "failure", str(e))
+        update_attempt_outcome(db, attempt_id, "failure", str(e))
 
         return {
             'success': False,
@@ -979,7 +978,7 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
     finally:
         # Always clean up container
         container.stop()
-        print(f"[Attempt {attempt_id or '???'}] Cleaned up container")
+        print(f"[Attempt {attempt_id}] Cleaned up container")
 
 
 # ============================================================================
