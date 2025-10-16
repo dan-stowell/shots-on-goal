@@ -1654,6 +1654,8 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
 
     # Create or get goal's working branch
     git_manager = GitManager(os.path.abspath(repo_path))
+    session_record = get_session_record(db)
+    session_id = session_record['session_id']
 
     if goal['git_branch']:
         # Use existing branch
@@ -1665,10 +1667,10 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
             base = parent_working_branch
         else:
             # Root goal - use session base branch
-            session_record = get_session_record(db)
             base = session_record['base_branch']
 
-        goal_working_branch = f"goal-{goal_id}"
+        # Include session ID to avoid conflicts across runs
+        goal_working_branch = f"s{session_id}-goal-{goal_id}"
         logging.info(f"{indent}[Goal {goal_id}] Creating working branch: {goal_working_branch} from {base}")
 
         # Create the branch
