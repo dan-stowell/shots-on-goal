@@ -1148,7 +1148,7 @@ class ToolLimitExceeded(Exception):
 
 def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="container",
                  model_id="openrouter/anthropic/claude-haiku-4.5", system_prompt=None, max_tools=20,
-                 goal_working_branch=None):
+                 goal_working_branch=None, previous_attempts=None):
     """
     Work on a goal using an LLM agent with tool access.
 
@@ -1162,6 +1162,7 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         system_prompt: Optional system prompt for the LLM
         max_tools: Maximum number of tool calls allowed (default: 20)
         goal_working_branch: Branch to base the attempt on (if None, uses session base_branch)
+        previous_attempts: List of previous attempt results (for feedback loop)
 
     Returns:
         dict with 'success', 'attempt_id', 'actions', 'outcome', 'response_text', 'attempt_branch'
@@ -1272,6 +1273,32 @@ Your task is to work towards achieving the goal. You should:
 4. Be methodical and explain your reasoning
 
 When you have successfully achieved the goal (or determined it cannot be achieved), explain your final status clearly."""
+
+            # Add feedback from previous attempts if any
+            if previous_attempts:
+                feedback_section = "\n\n**IMPORTANT - Previous Attempts:**\n"
+                feedback_section += f"This goal has been attempted {len(previous_attempts)} time(s) before. Learn from these attempts:\n\n"
+
+                for i, prev in enumerate(previous_attempts, 1):
+                    outcome = prev['outcome']
+                    feedback_section += f"Attempt {i}: {outcome}\n"
+
+                    # Include error details if available
+                    if 'error' in prev:
+                        error_msg = str(prev['error'])[:200]  # Truncate long errors
+                        feedback_section += f"  Error: {error_msg}\n"
+
+                    # Include validation failures if available
+                    if outcome == 'error' and 'actions' in prev and len(prev['actions']) > 0:
+                        # The validation failure info would be in the final actions/result
+                        feedback_section += f"  ({len(prev['actions'])} tool calls were made)\n"
+
+                feedback_section += "\n**What to do differently:**\n"
+                feedback_section += "- Analyze what went wrong in previous attempts\n"
+                feedback_section += "- Try a different approach or fix the specific errors\n"
+                feedback_section += "- Pay attention to validation failures from previous attempts\n"
+
+                system_prompt += feedback_section
 
         # Execute LLM chain with tools
         logging.info(f"[Attempt {attempt_id}] Starting LLM agent with model {model_id}")
@@ -1471,14 +1498,14 @@ When you have successfully achieved the goal (or determined it cannot be achieve
 # Goal Decomposition
 # ============================================================================
 
-def decompose_goal(db, goal_id, attempt_result, model_id="openrouter/anthropic/claude-haiku-4.5"):
+def decompose_goal(db, goal_id, attempt_results, model_id="openrouter/anthropic/claude-haiku-4.5"):
     """
     Decompose a goal into sub-goals using LLM.
 
     Args:
         db: Database connection
         goal_id: Goal ID that needs decomposition
-        attempt_result: Result dict from work_on_goal()
+        attempt_results: List of result dicts from work_on_goal() attempts
         model_id: LLM model to use
 
     Returns:
@@ -1486,36 +1513,43 @@ def decompose_goal(db, goal_id, attempt_result, model_id="openrouter/anthropic/c
     """
     goal = get_goal(db, goal_id)
     goal_description = goal['description']
-    outcome = attempt_result['outcome']
-    actions = attempt_result['actions']
 
-    logging.info(f"[Goal {goal_id}] Decomposing goal after outcome: {outcome}")
+    logging.info(f"[Goal {goal_id}] Decomposing goal after {len(attempt_results)} attempts")
 
-    # Build context about what was attempted
-    tools_used = [action['tool'] for action in actions]
-    tool_summary = ", ".join(set(tools_used[:10]))  # First 10 unique tools
+    # Build context about all attempts
+    attempts_summary = []
+    for i, result in enumerate(attempt_results, 1):
+        outcome = result['outcome']
+        actions = result.get('actions', [])
+        tools_used = [action['tool'] for action in actions]
+        tool_summary = ", ".join(set(tools_used[:10]))  # First 10 unique tools
+
+        attempt_info = f"Attempt {i}: {outcome}"
+        if actions:
+            attempt_info += f" ({len(actions)} tool calls: {tool_summary})"
+        if 'error' in result:
+            error_msg = str(result['error'])[:150]
+            attempt_info += f" - Error: {error_msg}"
+
+        attempts_summary.append(attempt_info)
 
     # Prompt for decomposition
-    decomposition_prompt = f"""A goal attempt did not succeed. Analyze the situation and break down the goal into smaller, concrete sub-goals.
+    decomposition_prompt = f"""A goal could not be achieved after multiple attempts. Analyze the situation and break down the goal into smaller, concrete sub-goals.
 
 **Original Goal:**
 {goal_description}
 
-**Attempt Outcome:**
-{outcome}
-
-**What was tried:**
-- {len(actions)} tool calls were made
-- Tools used: {tool_summary}
-{f"- Error: {attempt_result.get('error', 'N/A')}" if outcome == 'error' else ''}
+**Attempts Made:**
+{chr(10).join(f'- {summary}' for summary in attempts_summary)}
 
 **Your task:**
-Break this goal down into 3-5 concrete, actionable sub-goals that:
-1. Are VERY SPECIFIC about what to create/modify (not exploratory or documentation tasks)
-2. Are smaller in scope (achievable in <20 tool calls each)
-3. Build toward achieving the original goal
-4. Build on each other sequentially (each sub-goal uses the results of previous ones)
-5. Have concrete validation commands that test functionality
+Analyze what went wrong in the attempts above and break this goal down into 3-5 concrete, actionable sub-goals that:
+1. AVOID the mistakes/errors from previous attempts
+2. Are VERY SPECIFIC about what to create/modify (not exploratory or documentation tasks)
+3. Are smaller in scope (achievable in <20 tool calls each)
+4. Build toward achieving the original goal
+5. Build on each other sequentially (each sub-goal uses the results of previous ones)
+6. Have concrete validation commands that test functionality
 
 **What makes a good sub-goal:**
 ✓ "Create MODULE.bazel with rules_python version 0.31.0"
@@ -1622,9 +1656,9 @@ Return ONLY valid JSON (you can wrap in ```json if you want):
 # ============================================================================
 
 def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, depth=0, max_depth=5,
-                          parent_working_branch=None):
+                          parent_working_branch=None, max_attempts_per_goal=3):
     """
-    Work on a goal recursively: try once, decompose if needed, work on sub-goals.
+    Work on a goal recursively: try multiple times, decompose if needed, work on sub-goals.
 
     Args:
         db: Database connection
@@ -1636,6 +1670,7 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
         depth: Current recursion depth
         max_depth: Maximum recursion depth
         parent_working_branch: Parent goal's working branch (None for root goal)
+        max_attempts_per_goal: Maximum attempts per goal before decomposing (default: 3)
 
     Returns:
         bool: True if goal completed successfully
@@ -1694,80 +1729,92 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
     if goal['status'] != 'in_progress':
         update_goal_status(db, goal_id, 'in_progress')
 
-    # Make one attempt
-    result = work_on_goal(
-        db=db,
-        goal_id=goal_id,
-        repo_path=repo_path,
-        image=image,
-        runtime=runtime,
-        model_id=model_id,
-        goal_working_branch=goal_working_branch
-    )
+    # Try multiple attempts with feedback loop
+    attempt_results = []
+    for attempt_num in range(1, max_attempts_per_goal + 1):
+        logging.info(f"{indent}[Goal {goal_id}] Attempt {attempt_num}/{max_attempts_per_goal}")
 
-    # Handle the outcome
-    if result['outcome'] == 'success':
-        logging.info(f"{indent}[Goal {goal_id}] ✓ Completed successfully")
-        update_goal_status(db, goal_id, 'completed')
-        return True
+        # Pass previous attempt info for feedback (if any)
+        previous_attempts = attempt_results if attempt_results else None
 
-    else:
-        # Not successful - check if we should decompose
-        # Only decompose root goals (goals without parents)
-        # Sub-goals that fail should not be decomposed further
-        if goal['parent_id'] is None:
+        result = work_on_goal(
+            db=db,
+            goal_id=goal_id,
+            repo_path=repo_path,
+            image=image,
+            runtime=runtime,
+            model_id=model_id,
+            goal_working_branch=goal_working_branch,
+            previous_attempts=previous_attempts
+        )
+
+        attempt_results.append(result)
+
+        # Handle the outcome
+        if result['outcome'] == 'success':
+            logging.info(f"{indent}[Goal {goal_id}] ✓ Completed successfully on attempt {attempt_num}")
+            update_goal_status(db, goal_id, 'completed')
+            return True
+        else:
+            logging.info(f"{indent}[Goal {goal_id}] Attempt {attempt_num} failed: {result['outcome']}")
+
+    # All attempts failed - check if we should decompose
+    # Only decompose root goals (goals without parents)
+    # Sub-goals that fail should not be decomposed further
+    if goal['parent_id'] is None:
             # Root goal - decompose and work on sub-goals
-            logging.info(f"{indent}[Goal {goal_id}] Outcome: {result['outcome']} - decomposing...")
+            logging.info(f"{indent}[Goal {goal_id}] All {max_attempts_per_goal} attempts failed - decomposing...")
 
-            sub_goal_ids = decompose_goal(db, goal_id, result, model_id=model_id)
+            sub_goal_ids = decompose_goal(db, goal_id, attempt_results, model_id=model_id)
 
             if not sub_goal_ids:
                 logging.warning(f"{indent}[Goal {goal_id}] No sub-goals created - marking as failed")
                 update_goal_status(db, goal_id, 'failed')
                 return False
+    else:
+        # Sub-goal failed - don't decompose further, just fail
+        logging.warning(f"{indent}[Goal {goal_id}] Sub-goal failed after {max_attempts_per_goal} attempts")
+        logging.warning(f"{indent}[Goal {goal_id}] Not decomposing (sub-goals don't decompose) - marking as failed")
+        update_goal_status(db, goal_id, 'failed')
+        return False
+
+    # Work on each sub-goal sequentially
+    # Each sub-goal branches from parent's working branch,
+    # and successful attempts are merged back into it
+    # STOP on first failure (fail-fast)
+    all_succeeded = True
+    for i, sub_goal_id in enumerate(sub_goal_ids, 1):
+        logging.info(f"{indent}[Goal {goal_id}] Working on sub-goal {i}/{len(sub_goal_ids)}")
+
+        success = work_on_goal_recursive(
+            db=db,
+            goal_id=sub_goal_id,
+            repo_path=repo_path,
+            image=image,
+            runtime=runtime,
+            model_id=model_id,
+            depth=depth + 1,
+            max_depth=max_depth,
+            parent_working_branch=goal_working_branch,  # Sub-goals build on parent's branch
+            max_attempts_per_goal=max_attempts_per_goal  # Pass through the max attempts
+        )
+
+        if not success:
+            all_succeeded = False
+            logging.warning(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} failed - stopping remaining sub-goals")
+            break  # Fail fast - don't process remaining sub-goals
         else:
-            # Sub-goal failed - don't decompose further, just fail
-            logging.warning(f"{indent}[Goal {goal_id}] Sub-goal failed with outcome: {result['outcome']}")
-            logging.warning(f"{indent}[Goal {goal_id}] Not decomposing (sub-goals don't decompose) - marking as failed")
-            update_goal_status(db, goal_id, 'failed')
-            return False
+            logging.info(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} succeeded - changes merged into {goal_working_branch}")
 
-        # Work on each sub-goal sequentially
-        # Each sub-goal branches from parent's working branch,
-        # and successful attempts are merged back into it
-        # STOP on first failure (fail-fast)
-        all_succeeded = True
-        for i, sub_goal_id in enumerate(sub_goal_ids, 1):
-            logging.info(f"{indent}[Goal {goal_id}] Working on sub-goal {i}/{len(sub_goal_ids)}")
-
-            success = work_on_goal_recursive(
-                db=db,
-                goal_id=sub_goal_id,
-                repo_path=repo_path,
-                image=image,
-                runtime=runtime,
-                model_id=model_id,
-                depth=depth + 1,
-                max_depth=max_depth,
-                parent_working_branch=goal_working_branch  # Sub-goals build on parent's branch
-            )
-
-            if not success:
-                all_succeeded = False
-                logging.warning(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} failed - stopping remaining sub-goals")
-                break  # Fail fast - don't process remaining sub-goals
-            else:
-                logging.info(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} succeeded - changes merged into {goal_working_branch}")
-
-        # Update parent goal status based on sub-goals
-        if all_succeeded:
-            logging.info(f"{indent}[Goal {goal_id}] ✓ All sub-goals completed - marking as completed")
-            update_goal_status(db, goal_id, 'completed')
-            return True
-        else:
-            logging.warning(f"{indent}[Goal {goal_id}] ✗ Some sub-goals failed - marking as failed")
-            update_goal_status(db, goal_id, 'failed')
-            return False
+    # Update parent goal status based on sub-goals
+    if all_succeeded:
+        logging.info(f"{indent}[Goal {goal_id}] ✓ All sub-goals completed - marking as completed")
+        update_goal_status(db, goal_id, 'completed')
+        return True
+    else:
+        logging.warning(f"{indent}[Goal {goal_id}] ✗ Some sub-goals failed - marking as failed")
+        update_goal_status(db, goal_id, 'failed')
+        return False
 
 
 # ============================================================================
@@ -1913,6 +1960,12 @@ def main():
         help='Container image to use (default: shots-on-goal:latest)'
     )
     parser.add_argument(
+        '--max-attempts',
+        type=int,
+        default=3,
+        help='Maximum attempts per goal before decomposing (default: 3)'
+    )
+    parser.add_argument(
         '--verbose',
         '-v',
         action='store_true',
@@ -1974,7 +2027,8 @@ def main():
             repo_path=str(repo_path),
             image=args.image,
             runtime=detect_container_runtime(),
-            model_id=args.model
+            model_id=args.model,
+            max_attempts_per_goal=args.max_attempts
         )
 
         print("\n" + "=" * 80)
