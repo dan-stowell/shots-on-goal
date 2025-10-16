@@ -14,6 +14,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 import json
+import llm
 
 
 # ============================================================================
@@ -837,11 +838,210 @@ class ToolExecutor:
 # Work Loop
 # ============================================================================
 
-def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="container"):
+def create_tool_functions(tools_executor):
     """
-    Execute a hardcoded sequence of tool calls for a goal (skeleton implementation).
+    Create LLM tool functions that wrap ToolExecutor methods.
 
-    This is a testing function to validate the plumbing before adding LLM integration.
+    Args:
+        tools_executor: ToolExecutor instance
+
+    Returns:
+        List of tool functions with docstrings
+    """
+
+    def read_file(path: str) -> str:
+        """
+        Read a file from the workspace.
+
+        Args:
+            path: Path to file relative to workspace root
+
+        Returns:
+            File contents as a string
+        """
+        result = tools_executor.read_file(path)
+        if result['success']:
+            return result['content']
+        else:
+            return f"ERROR: {result['error']}"
+
+    def write_file(path: str, content: str) -> str:
+        """
+        Write content to a file in the workspace.
+
+        Args:
+            path: Path to file relative to workspace root
+            content: Content to write to the file
+
+        Returns:
+            Success message or error
+        """
+        result = tools_executor.write_file(path, content)
+        if result['success']:
+            return f"Successfully wrote to {path}"
+        else:
+            return f"ERROR: {result['error']}"
+
+    def find_replace_in_file(path: str, old_text: str, new_text: str) -> str:
+        """
+        Find and replace text in a file. Requires exactly one match.
+
+        Args:
+            path: Path to file relative to workspace root
+            old_text: Text to find (must match exactly once)
+            new_text: Text to replace with
+
+        Returns:
+            Success message or error
+        """
+        result = tools_executor.find_replace_in_file(path, old_text, new_text)
+        if result['success']:
+            return f"Successfully replaced text in {path}"
+        else:
+            return f"ERROR: {result['error']}"
+
+    def list_directory(path: str = ".") -> str:
+        """
+        List files in a directory.
+
+        Args:
+            path: Directory path (default: current directory)
+
+        Returns:
+            Newline-separated list of files
+        """
+        result = tools_executor.list_directory(path)
+        if result['success']:
+            return "\n".join(result['files'])
+        else:
+            return f"ERROR: {result['error']}"
+
+    def find_files(pattern: str, path: str = ".") -> str:
+        """
+        Find files by name pattern.
+
+        Args:
+            pattern: Filename pattern (glob style, e.g., "*.py" or "BUILD*")
+            path: Path to search in (default: current directory)
+
+        Returns:
+            Newline-separated list of matching file paths
+        """
+        result = tools_executor.find_files(pattern, path)
+        if result['success']:
+            return "\n".join(result['files']) if result['files'] else "No files found"
+        else:
+            return f"ERROR: {result['error']}"
+
+    def ripgrep(pattern: str, path: str = ".", glob: str = None, ignore_case: bool = False) -> str:
+        """
+        Search code using ripgrep.
+
+        Args:
+            pattern: Search pattern (regex)
+            path: Path to search in (default: current directory)
+            glob: Optional glob pattern to filter files (e.g., "*.py")
+            ignore_case: Case-insensitive search (default: false)
+
+        Returns:
+            Search results in JSON format
+        """
+        result = tools_executor.ripgrep(pattern, path, glob, ignore_case)
+        if result['success']:
+            return result['stdout'] if result['stdout'] else "No matches found"
+        else:
+            return f"ERROR: {result['stderr']}"
+
+    def bazel_build(targets: str = "//...", flags: str = None) -> str:
+        """
+        Build Bazel targets.
+
+        Args:
+            targets: Bazel target pattern (default: //...)
+            flags: Optional space-separated bazel flags
+
+        Returns:
+            Build output or error message
+        """
+        flag_list = flags.split() if flags else None
+        result = tools_executor.bazel_build(targets, flag_list)
+
+        output = []
+        if result['stdout']:
+            output.append(result['stdout'])
+        if result['stderr']:
+            output.append(result['stderr'])
+
+        if result['success']:
+            return "\n".join(output) or "Build succeeded"
+        else:
+            return f"Build failed (exit code {result['exit_code']}):\n" + "\n".join(output)
+
+    def bazel_test(targets: str = "//...", flags: str = None) -> str:
+        """
+        Run Bazel tests.
+
+        Args:
+            targets: Bazel test target pattern (default: //...)
+            flags: Optional space-separated bazel flags
+
+        Returns:
+            Test output or error message
+        """
+        flag_list = flags.split() if flags else None
+        result = tools_executor.bazel_test(targets, flag_list)
+
+        output = []
+        if result['stdout']:
+            output.append(result['stdout'])
+        if result['stderr']:
+            output.append(result['stderr'])
+
+        if result['success']:
+            return "\n".join(output) or "Tests passed"
+        else:
+            return f"Tests failed (exit code {result['exit_code']}):\n" + "\n".join(output)
+
+    def bazel_query(query: str) -> str:
+        """
+        Query the Bazel build graph.
+
+        Args:
+            query: Bazel query expression (e.g., "//..." or "deps(//pkg:target)")
+
+        Returns:
+            Query results or error message
+        """
+        result = tools_executor.bazel_query(query)
+
+        output = []
+        if result['stdout']:
+            output.append(result['stdout'])
+        if result['stderr']:
+            output.append(result['stderr'])
+
+        if result['success']:
+            return "\n".join(output) or "Query succeeded"
+        else:
+            return f"Query failed (exit code {result['exit_code']}):\n" + "\n".join(output)
+
+    return [
+        read_file,
+        write_file,
+        find_replace_in_file,
+        list_directory,
+        find_files,
+        ripgrep,
+        bazel_build,
+        bazel_test,
+        bazel_query,
+    ]
+
+
+def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="container",
+                 model_id="openrouter/anthropic/claude-haiku-4.5", system_prompt=None):
+    """
+    Work on a goal using an LLM agent with tool access.
 
     Args:
         db: Database connection
@@ -849,9 +1049,11 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         repo_path: Path to the repository
         image: Container image to use
         runtime: Container runtime ('container' or 'docker')
+        model_id: LLM model to use (default: openrouter/anthropic/claude-haiku-4.5)
+        system_prompt: Optional system prompt for the LLM
 
     Returns:
-        dict with 'success', 'attempt_id', 'actions', 'outcome'
+        dict with 'success', 'attempt_id', 'actions', 'outcome', 'response_text'
     """
     # Get session info for base branch
     session_record = get_session_record(db)
@@ -890,60 +1092,75 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         update_attempt_metadata(db, attempt_id, container_id=container_id)
 
         # Initialize tool executor
-        tools = ToolExecutor(container)
+        tools_executor = ToolExecutor(container)
 
-        # ============================================================
-        # Hardcoded sequence of tool calls for testing
-        # ============================================================
+        # Create tool functions for LLM
+        tool_functions = create_tool_functions(tools_executor)
 
-        # 1. List files in the workspace
-        print(f"[Attempt {attempt_id}] Listing workspace files...")
-        result = tools.list_directory(".")
-        record_action(db, attempt_id, "list_directory", {"path": "."}, json.dumps(result))
-        actions.append({"tool": "list_directory", "result": result})
-        print(f"  Found {len(result.get('files', []))} files")
+        # Get the goal description
+        goal = get_goal(db, goal_id)
+        goal_description = goal['description']
 
-        # 2. Try to find BUILD files
-        print(f"[Attempt {attempt_id}] Searching for BUILD files...")
-        result = tools.find_files("BUILD*", ".")
-        record_action(db, attempt_id, "find_files", {"pattern": "BUILD*", "path": "."}, json.dumps(result))
-        actions.append({"tool": "find_files", "result": result})
-        build_files = result.get('files', [])
-        print(f"  Found {len(build_files)} BUILD files")
+        print(f"[Attempt {attempt_id}] Working on goal: {goal_description}")
 
-        # 3. If there's a README, read it
-        print(f"[Attempt {attempt_id}] Looking for README...")
-        readme_result = tools.find_files("README*", ".")
-        readme_files = readme_result.get('files', [])
+        # Set up after_call hook to record tool calls
+        def after_call(tool, tool_call, tool_result):
+            """Record each tool call in the database"""
+            # Get tool name safely - handles both llm.Tool instances and plain functions
+            tool_name = getattr(tool, "name", getattr(tool, "__name__", "unknown"))
 
-        if readme_files:
-            readme_path = readme_files[0]
-            print(f"[Attempt {attempt_id}] Reading {readme_path}...")
-            result = tools.read_file(readme_path)
-            record_action(db, attempt_id, "read_file", {"path": readme_path}, json.dumps(result))
-            actions.append({"tool": "read_file", "result": result})
+            record_action(
+                db,
+                attempt_id,
+                tool_name,
+                tool_call.arguments,
+                tool_result.output
+            )
+            actions.append({
+                "tool": tool_name,
+                "arguments": tool_call.arguments,
+                "output": tool_result.output
+            })
+            print(f"  Tool: {tool_name}({tool_call.arguments})")
 
-            if result['success']:
-                content_length = len(result.get('content', ''))
-                print(f"  Read {content_length} characters")
+        # Get LLM model
+        model = llm.get_model(model_id)
 
-        # 4. Try a bazel query if there are BUILD files
-        if build_files:
-            print(f"[Attempt {attempt_id}] Running bazel query...")
-            result = tools.bazel_query("//...")
-            record_action(db, attempt_id, "bazel_query", {"query": "//..."}, json.dumps(result))
-            actions.append({"tool": "bazel_query", "result": result})
+        # Default system prompt if none provided
+        if system_prompt is None:
+            system_prompt = """You are an autonomous coding agent working on a specific goal in a git repository.
 
-            if result['success']:
-                print(f"  Query succeeded")
-            else:
-                print(f"  Query failed: {result.get('stderr', 'Unknown error')[:100]}")
+You have access to tools to read files, search code, modify files, and run Bazel commands.
+
+Your task is to work towards achieving the goal. You should:
+1. Explore the repository to understand its structure
+2. Make necessary changes to achieve the goal
+3. Test your changes using Bazel build/test commands when appropriate
+4. Be methodical and explain your reasoning
+
+When you have successfully achieved the goal (or determined it cannot be achieved), explain your final status clearly."""
+
+        # Execute LLM chain with tools
+        print(f"[Attempt {attempt_id}] Starting LLM agent...")
+        chain = model.chain(
+            goal_description,
+            system=system_prompt,
+            tools=tool_functions,
+            after_call=after_call
+        )
+
+        # Get the response text
+        response_text = chain.text()
+
+        print(f"[Attempt {attempt_id}] LLM agent completed")
+        print(f"[Attempt {attempt_id}] Response: {response_text[:200]}...")
 
         # ============================================================
         # Determine outcome
         # ============================================================
 
-        # For this skeleton, we just mark it as successful if we got through all steps
+        # For now, we mark it as successful if the LLM completed without errors
+        # In the future, we can parse the response to determine success/failure
         outcome = "success"
         failure_reason = None
 
@@ -956,7 +1173,8 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
             'success': True,
             'attempt_id': attempt_id,
             'actions': actions,
-            'outcome': outcome
+            'outcome': outcome,
+            'response_text': response_text
         }
 
     except Exception as e:
