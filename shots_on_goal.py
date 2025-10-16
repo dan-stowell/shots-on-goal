@@ -1276,6 +1276,8 @@ When you have successfully achieved the goal (or determined it cannot be achieve
 
             # Add feedback from previous attempts if any
             if previous_attempts:
+                logging.info(f"[Attempt {attempt_id}] Including feedback from {len(previous_attempts)} previous attempt(s)")
+
                 feedback_section = "\n\n**IMPORTANT - Previous Attempts:**\n"
                 feedback_section += f"This goal has been attempted {len(previous_attempts)} time(s) before. Learn from these attempts:\n\n"
 
@@ -1283,10 +1285,14 @@ When you have successfully achieved the goal (or determined it cannot be achieve
                     outcome = prev['outcome']
                     feedback_section += f"Attempt {i}: {outcome}\n"
 
+                    # Log summary of each previous attempt
+                    logging.info(f"[Attempt {attempt_id}]   Previous attempt {i}: {outcome}")
+
                     # Include error details if available
                     if 'error' in prev:
                         error_msg = str(prev['error'])[:200]  # Truncate long errors
                         feedback_section += f"  Error: {error_msg}\n"
+                        logging.info(f"[Attempt {attempt_id}]     Error: {error_msg[:100]}")
 
                     # Include validation failures if available
                     if outcome == 'error' and 'actions' in prev and len(prev['actions']) > 0:
