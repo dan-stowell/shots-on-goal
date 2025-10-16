@@ -1148,7 +1148,7 @@ class ToolLimitExceeded(Exception):
 
 def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="container",
                  model_id="openrouter/anthropic/claude-haiku-4.5", system_prompt=None, max_tools=20,
-                 goal_working_branch=None, previous_attempts=None):
+                 goal_working_branch=None, previous_attempts=None, merge_target_branch=None):
     """
     Work on a goal using an LLM agent with tool access.
 
@@ -1163,6 +1163,7 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         max_tools: Maximum number of tool calls allowed (default: 20)
         goal_working_branch: Branch to base the attempt on (if None, uses session base_branch)
         previous_attempts: List of previous attempt results (for feedback loop)
+        merge_target_branch: Branch to merge into on success (if None, uses goal_working_branch)
 
     Returns:
         dict with 'success', 'attempt_id', 'actions', 'outcome', 'response_text', 'attempt_branch'
@@ -1423,10 +1424,12 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             logging.info(f"[Attempt {attempt_id}] No changes to commit")
 
         # If successful, merge attempt branch into goal's working branch
-        if outcome == "success" and goal_working_branch:
-            logging.info(f"[Attempt {attempt_id}] Merging {branch_name} into {goal_working_branch}")
+        # Use merge_target_branch if specified, otherwise use goal_working_branch
+        target_branch = merge_target_branch if merge_target_branch else goal_working_branch
+        if outcome == "success" and target_branch:
+            logging.info(f"[Attempt {attempt_id}] Merging {branch_name} into {target_branch}")
             try:
-                git_manager.merge_branch(branch_name, goal_working_branch, no_ff=True)
+                git_manager.merge_branch(branch_name, target_branch, no_ff=True)
                 logging.info(f"[Attempt {attempt_id}] ✓ Merged successfully")
             except subprocess.CalledProcessError as e:
                 logging.error(f"[Attempt {attempt_id}] Failed to merge: {e}")
@@ -1742,11 +1745,21 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
 
     # Try multiple attempts with feedback loop
     attempt_results = []
+    current_base_branch = goal_working_branch  # Start from goal's working branch
+
     for attempt_num in range(1, max_attempts_per_goal + 1):
         logging.info(f"{indent}[Goal {goal_id}] Attempt {attempt_num}/{max_attempts_per_goal}")
 
         # Pass previous attempt info for feedback (if any)
         previous_attempts = attempt_results if attempt_results else None
+
+        # For attempt 1, use goal_working_branch
+        # For attempts 2+, use the previous attempt's branch to build on partial progress
+        if attempt_num > 1 and attempt_results:
+            prev_attempt_branch = attempt_results[-1].get('attempt_branch')
+            if prev_attempt_branch:
+                current_base_branch = prev_attempt_branch
+                logging.info(f"{indent}[Goal {goal_id}]   Branching from previous attempt: {prev_attempt_branch}")
 
         result = work_on_goal(
             db=db,
@@ -1755,8 +1768,9 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
             image=image,
             runtime=runtime,
             model_id=model_id,
-            goal_working_branch=goal_working_branch,
-            previous_attempts=previous_attempts
+            goal_working_branch=current_base_branch,
+            previous_attempts=previous_attempts,
+            merge_target_branch=goal_working_branch  # Always merge into the original goal branch
         )
 
         attempt_results.append(result)
