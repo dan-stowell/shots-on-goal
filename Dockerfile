@@ -25,6 +25,9 @@ RUN curl -Lo /usr/local/bin/bazel \
 # Verify installations
 RUN bazel --version && rg --version
 
+# Copy Bazel configuration to enforce bzlmod
+COPY shots-on-goal.bazelrc /root/.bazelrc
+
 # Create workspace directory
 WORKDIR /workspace
 

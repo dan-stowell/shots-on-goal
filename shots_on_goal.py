@@ -14,6 +14,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 import json
+import logging
 import llm
 
 
@@ -78,9 +79,16 @@ def init_database(db_path):
             worktree_path TEXT,
             container_id TEXT,
             git_commit_sha TEXT,
+            final_commit_sha TEXT,
             FOREIGN KEY (goal_id) REFERENCES goals(id)
         )
     """)
+
+    # Add final_commit_sha column if it doesn't exist (for existing databases)
+    cursor.execute("PRAGMA table_info(attempts)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if 'final_commit_sha' not in columns:
+        cursor.execute("ALTER TABLE attempts ADD COLUMN final_commit_sha TEXT")
 
     # Actions table (tool calls during attempts)
     cursor.execute("""
@@ -246,7 +254,7 @@ def record_action(db, attempt_id, tool_name, parameters, result):
 
 def update_attempt_metadata(db, attempt_id, git_branch=None,
                             worktree_path=None, container_id=None,
-                            git_commit_sha=None):
+                            git_commit_sha=None, final_commit_sha=None):
     """Update mutable metadata for an attempt."""
     fields = []
     values = []
@@ -263,6 +271,9 @@ def update_attempt_metadata(db, attempt_id, git_branch=None,
     if git_commit_sha is not None:
         fields.append("git_commit_sha = ?")
         values.append(git_commit_sha)
+    if final_commit_sha is not None:
+        fields.append("final_commit_sha = ?")
+        values.append(final_commit_sha)
 
     if not fields:
         return
@@ -448,6 +459,58 @@ class GitManager:
             worktrees.append(current_worktree)
 
         return worktrees
+
+    def commit_worktree_changes(self, worktree_path, message):
+        """
+        Commit all changes in a worktree.
+
+        Args:
+            worktree_path: Path to the worktree
+            message: Commit message
+
+        Returns:
+            commit_sha of the new commit, or None if nothing to commit
+        """
+        # Add all changes
+        subprocess.run(
+            ['git', 'add', '-A'],
+            cwd=worktree_path,
+            check=True,
+            capture_output=True
+        )
+
+        # Check if there are changes to commit
+        status_result = subprocess.run(
+            ['git', 'status', '--porcelain'],
+            cwd=worktree_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+
+        if not status_result.stdout.strip():
+            # No changes to commit
+            logging.debug(f"No changes to commit in {worktree_path}")
+            return None
+
+        # Commit the changes
+        subprocess.run(
+            ['git', 'commit', '-m', message],
+            cwd=worktree_path,
+            check=True,
+            capture_output=True
+        )
+
+        # Get the new commit SHA
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=worktree_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+
+        return result.stdout.strip()
 
 
 # ============================================================================
@@ -1061,8 +1124,13 @@ def create_tool_functions(tools_executor):
     ]
 
 
+class ToolLimitExceeded(Exception):
+    """Raised when tool call limit is exceeded"""
+    pass
+
+
 def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="container",
-                 model_id="openrouter/anthropic/claude-haiku-4.5", system_prompt=None):
+                 model_id="openrouter/anthropic/claude-haiku-4.5", system_prompt=None, max_tools=20):
     """
     Work on a goal using an LLM agent with tool access.
 
@@ -1074,6 +1142,7 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         runtime: Container runtime ('container' or 'docker')
         model_id: LLM model to use (default: openrouter/anthropic/claude-haiku-4.5)
         system_prompt: Optional system prompt for the LLM
+        max_tools: Maximum number of tool calls allowed (default: 20)
 
     Returns:
         dict with 'success', 'attempt_id', 'actions', 'outcome', 'response_text'
@@ -1125,13 +1194,17 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         goal = get_goal(db, goal_id)
         goal_description = goal['description']
 
-        print(f"[Attempt {attempt_id}] Working on goal: {goal_description}")
+        logging.info(f"[Attempt {attempt_id}] Working on goal: {goal_description}")
 
         # Set up after_call hook to record tool calls
         def after_call(tool, tool_call, tool_result):
             """Record each tool call in the database"""
             # Get tool name safely - handles both llm.Tool instances and plain functions
             tool_name = getattr(tool, "name", getattr(tool, "__name__", "unknown"))
+
+            # Log tool call with sanitized arguments
+            args_str = str(tool_call.arguments)[:100]  # Truncate long args
+            logging.info(f"  Tool {len(actions)+1}/{max_tools}: {tool_name}({args_str})")
 
             record_action(
                 db,
@@ -1145,7 +1218,11 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
                 "arguments": tool_call.arguments,
                 "output": tool_result.output
             })
-            print(f"  Tool: {tool_name}({tool_call.arguments})")
+
+            # Check if we've exceeded the tool limit
+            if len(actions) >= max_tools:
+                logging.warning(f"[Attempt {attempt_id}] Tool limit ({max_tools}) reached")
+                raise ToolLimitExceeded(f"Tool limit of {max_tools} exceeded")
 
         # Get LLM model
         model = llm.get_model(model_id)
@@ -1165,7 +1242,7 @@ Your task is to work towards achieving the goal. You should:
 When you have successfully achieved the goal (or determined it cannot be achieved), explain your final status clearly."""
 
         # Execute LLM chain with tools
-        print(f"[Attempt {attempt_id}] Starting LLM agent...")
+        logging.info(f"[Attempt {attempt_id}] Starting LLM agent with model {model_id}")
         chain = model.chain(
             goal_description,
             system=system_prompt,
@@ -1176,8 +1253,8 @@ When you have successfully achieved the goal (or determined it cannot be achieve
         # Get the response text
         response_text = chain.text()
 
-        print(f"[Attempt {attempt_id}] LLM agent completed")
-        print(f"[Attempt {attempt_id}] Response: {response_text[:200]}...")
+        logging.info(f"[Attempt {attempt_id}] LLM agent completed - {len(actions)} tools used")
+        logging.debug(f"[Attempt {attempt_id}] Response: {response_text[:200]}...")
 
         # ============================================================
         # Determine outcome
@@ -1188,7 +1265,18 @@ When you have successfully achieved the goal (or determined it cannot be achieve
         outcome = "success"
         failure_reason = None
 
-        print(f"[Attempt {attempt_id}] Completed with outcome: {outcome}")
+        logging.info(f"[Attempt {attempt_id}] Completed with outcome: {outcome}")
+
+        # Commit all changes made during the attempt
+        final_commit_sha = git_manager.commit_worktree_changes(
+            worktree_path,
+            f"Attempt {attempt_id}: {outcome}\n\nGoal: {goal_description}"
+        )
+        if final_commit_sha:
+            logging.info(f"[Attempt {attempt_id}] Committed changes: {final_commit_sha[:8]}")
+            update_attempt_metadata(db, attempt_id, final_commit_sha=final_commit_sha)
+        else:
+            logging.info(f"[Attempt {attempt_id}] No changes to commit")
 
         # Update attempt with outcome
         update_attempt_outcome(db, attempt_id, outcome, failure_reason)
@@ -1201,9 +1289,46 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             'response_text': response_text
         }
 
+    except ToolLimitExceeded as e:
+        # Tool limit exceeded - mark as needs decomposition
+        logging.warning(f"[Attempt {attempt_id}] Tool limit exceeded - needs decomposition")
+
+        # Commit changes even if we hit the limit
+        if 'worktree_path' in locals():
+            final_commit_sha = git_manager.commit_worktree_changes(
+                worktree_path,
+                f"Attempt {attempt_id}: needs_decomposition (tool limit exceeded)\n\nGoal: {goal_description}"
+            )
+            if final_commit_sha:
+                logging.info(f"[Attempt {attempt_id}] Committed changes: {final_commit_sha[:8]}")
+                update_attempt_metadata(db, attempt_id, final_commit_sha=final_commit_sha)
+
+        update_attempt_outcome(db, attempt_id, "needs_decomposition", str(e))
+
+        return {
+            'success': False,
+            'attempt_id': attempt_id,
+            'actions': actions,
+            'outcome': "needs_decomposition",
+            'error': str(e)
+        }
+
     except Exception as e:
         # If something went wrong, record failure
-        print(f"[Attempt {attempt_id}] Failed with exception: {e}")
+        logging.error(f"[Attempt {attempt_id}] Failed with exception: {e}")
+
+        # Commit changes even on failure
+        if 'worktree_path' in locals():
+            try:
+                final_commit_sha = git_manager.commit_worktree_changes(
+                    worktree_path,
+                    f"Attempt {attempt_id}: failure\n\nGoal: {goal_description}\n\nError: {str(e)}"
+                )
+                if final_commit_sha:
+                    logging.info(f"[Attempt {attempt_id}] Committed changes: {final_commit_sha[:8]}")
+                    update_attempt_metadata(db, attempt_id, final_commit_sha=final_commit_sha)
+            except Exception as commit_error:
+                logging.warning(f"[Attempt {attempt_id}] Failed to commit changes: {commit_error}")
 
         update_attempt_outcome(db, attempt_id, "failure", str(e))
 
@@ -1218,7 +1343,7 @@ When you have successfully achieved the goal (or determined it cannot be achieve
     finally:
         # Always clean up container
         container.stop()
-        print(f"[Attempt {attempt_id}] Cleaned up container")
+        logging.debug(f"[Attempt {attempt_id}] Cleaned up container")
 
 
 # ============================================================================
@@ -1317,6 +1442,13 @@ def list_sessions():
 # ============================================================================
 
 def main():
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%H:%M:%S'
+    )
+
     parser = argparse.ArgumentParser(
         description="Shots on Goal - Autonomous goal-driven code migration"
     )
@@ -1356,8 +1488,18 @@ def main():
         default='shots-on-goal:latest',
         help='Container image to use (default: shots-on-goal:latest)'
     )
+    parser.add_argument(
+        '--verbose',
+        '-v',
+        action='store_true',
+        help='Enable verbose (DEBUG) logging'
+    )
 
     args = parser.parse_args()
+
+    # Update logging level if verbose
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     # Handle list command
     if args.list:
@@ -1390,10 +1532,11 @@ def main():
 
     # Create new session
     session_dir, db = create_session(args.goal, str(repo_path))
+    logging.info(f"Created session: {session_dir.name}")
 
     # Create root goal
     root_goal_id = create_goal(db, args.goal)
-    print(f"Created root goal: {args.goal} (ID: {root_goal_id})")
+    logging.info(f"Created root goal (ID: {root_goal_id}): {args.goal}")
 
     # Start working on the root goal
     print("\n" + "=" * 80)

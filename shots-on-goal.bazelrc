@@ -1,0 +1,8 @@
+# Bazelrc for shots-on-goal container environment
+# Forces use of MODULE.bazel (bzlmod) and disables WORKSPACE
+
+# Enable bzlmod for all commands
+common --enable_bzlmod
+
+# Disable WORKSPACE file support
+common --noenable_workspace
