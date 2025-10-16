@@ -16,6 +16,7 @@ from pathlib import Path
 import json
 import logging
 import llm
+from llm.utils import extract_fenced_code_block
 
 
 # ============================================================================
@@ -61,10 +62,17 @@ def init_database(db_path):
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP,
             git_branch TEXT,
+            validation_commands TEXT,
             FOREIGN KEY (parent_id) REFERENCES goals(id),
             FOREIGN KEY (created_by_goal_id) REFERENCES goals(id)
         )
     """)
+
+    # Add validation_commands column if it doesn't exist (for existing databases)
+    cursor.execute("PRAGMA table_info(goals)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if 'validation_commands' not in columns:
+        cursor.execute("ALTER TABLE goals ADD COLUMN validation_commands TEXT")
 
     # Attempts table
     cursor.execute("""
@@ -144,16 +152,20 @@ def update_session_status(db, status):
 
 
 def create_goal(db, description, parent_id=None, goal_type='implementation',
-                created_by_goal_id=None, git_branch=None):
+                created_by_goal_id=None, git_branch=None, validation_commands=None):
     """
     Create a new goal and return its ID.
+
+    Args:
+        validation_commands: JSON string of validation commands
+                            e.g., '[{"command": "bazel build //...", "expect": "success"}]'
     """
     cursor = db.execute(
         """
-        INSERT INTO goals (description, parent_id, goal_type, created_by_goal_id, git_branch)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO goals (description, parent_id, goal_type, created_by_goal_id, git_branch, validation_commands)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (description, parent_id, goal_type, created_by_goal_id, git_branch)
+        (description, parent_id, goal_type, created_by_goal_id, git_branch, validation_commands)
     )
     db.commit()
     return cursor.lastrowid
@@ -1135,7 +1147,8 @@ class ToolLimitExceeded(Exception):
 
 
 def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="container",
-                 model_id="openrouter/anthropic/claude-haiku-4.5", system_prompt=None, max_tools=20):
+                 model_id="openrouter/anthropic/claude-haiku-4.5", system_prompt=None, max_tools=20,
+                 goal_working_branch=None):
     """
     Work on a goal using an LLM agent with tool access.
 
@@ -1148,14 +1161,20 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         model_id: LLM model to use (default: openrouter/anthropic/claude-haiku-4.5)
         system_prompt: Optional system prompt for the LLM
         max_tools: Maximum number of tool calls allowed (default: 20)
+        goal_working_branch: Branch to base the attempt on (if None, uses session base_branch)
 
     Returns:
-        dict with 'success', 'attempt_id', 'actions', 'outcome', 'response_text'
+        dict with 'success', 'attempt_id', 'actions', 'outcome', 'response_text', 'attempt_branch'
     """
-    # Get session info for base branch
+    # Get session info
     session_record = get_session_record(db)
-    base_branch = session_record['base_branch']
     session_id = session_record['session_id']
+
+    # Determine base branch for this attempt
+    if goal_working_branch:
+        base_branch = goal_working_branch
+    else:
+        base_branch = session_record['base_branch']
 
     # Initialize managers (use absolute path)
     abs_repo_path = os.path.abspath(repo_path)
@@ -1236,9 +1255,15 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
 
         # Default system prompt if none provided
         if system_prompt is None:
-            system_prompt = """You are an autonomous coding agent working on a specific goal in a git repository.
+            system_prompt = f"""You are an autonomous coding agent working on a specific goal in a git repository.
 
 You have access to tools to read files, search code, modify files, and run Bazel commands.
+
+**Important constraints:**
+- You have {max_tools} tool calls to achieve this goal
+- Use tools efficiently to stay within the limit
+- For Bazel projects: use MODULE.bazel with bzlmod, NOT WORKSPACE files
+- The container has bzlmod enabled by default (--enable_bzlmod, --noenable_workspace)
 
 Your task is to work towards achieving the goal. You should:
 1. Explore the repository to understand its structure
@@ -1267,10 +1292,84 @@ When you have successfully achieved the goal (or determined it cannot be achieve
         # Determine outcome
         # ============================================================
 
-        # For now, we mark it as successful if the LLM completed without errors
-        # In the future, we can parse the response to determine success/failure
-        outcome = "success"
-        failure_reason = None
+        # Check if code changes were made
+        git_status_result = subprocess.run(
+            ['git', 'status', '--porcelain'],
+            cwd=worktree_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        has_changes = bool(git_status_result.stdout.strip())
+
+        # Get validation commands if present
+        validation_commands_json = goal['validation_commands']
+        has_validation = bool(validation_commands_json)
+
+        if has_validation:
+            # Goal has validation commands - must have changes AND pass validation
+            if not has_changes:
+                logging.info(f"[Attempt {attempt_id}] No code changes made (but validation required)")
+                outcome = "error"
+                failure_reason = "No code changes made"
+            else:
+                logging.info(f"[Attempt {attempt_id}] Code changes detected")
+
+                # Run validation commands
+                validation_passed = True
+                validation_errors = []
+
+                try:
+                    validation_commands = json.loads(validation_commands_json)
+                    logging.info(f"[Attempt {attempt_id}] Running {len(validation_commands)} validation commands")
+
+                    for i, val_cmd in enumerate(validation_commands, 1):
+                        command = val_cmd.get('command', '')
+                        expect = val_cmd.get('expect', 'success')
+
+                        logging.info(f"[Attempt {attempt_id}]   Validation {i}/{len(validation_commands)}: {command}")
+
+                        # Run the validation command in container
+                        result = container.exec(command, timeout=120)
+
+                        # Check if it succeeded (expect == 'success' means exit code 0)
+                        if expect == 'success':
+                            if result.returncode == 0:
+                                logging.info(f"[Attempt {attempt_id}]   ✓ Validation {i} passed")
+                            else:
+                                logging.warning(f"[Attempt {attempt_id}]   ✗ Validation {i} failed (exit code {result.returncode})")
+                                validation_passed = False
+                                validation_errors.append(f"Command '{command}' failed with exit code {result.returncode}")
+                                # Log stderr for debugging
+                                if result.stderr:
+                                    logging.debug(f"[Attempt {attempt_id}]     stderr: {result.stderr[:200]}")
+                        else:
+                            # For other expectations, we could extend this in the future
+                            logging.warning(f"[Attempt {attempt_id}]   ? Unknown expectation: {expect}")
+
+                except json.JSONDecodeError as e:
+                    logging.warning(f"[Attempt {attempt_id}] Failed to parse validation_commands JSON: {e}")
+                    validation_passed = False
+                    validation_errors.append(f"JSON parsing error: {e}")
+
+                # Determine final outcome
+                if validation_passed:
+                    outcome = "success"
+                    failure_reason = None
+                    logging.info(f"[Attempt {attempt_id}] ✓ All validations passed")
+                else:
+                    outcome = "error"
+                    failure_reason = "Validation failed: " + "; ".join(validation_errors)
+                    logging.info(f"[Attempt {attempt_id}] ✗ Validation failed")
+        else:
+            # No validation commands - success if LLM completed without error
+            # This handles exploratory goals that don't require code changes
+            outcome = "success"
+            failure_reason = None
+            if has_changes:
+                logging.info(f"[Attempt {attempt_id}] ✓ Completed with code changes (no validation required)")
+            else:
+                logging.info(f"[Attempt {attempt_id}] ✓ Completed successfully (no validation required)")
 
         logging.info(f"[Attempt {attempt_id}] Completed with outcome: {outcome}")
 
@@ -1285,15 +1384,28 @@ When you have successfully achieved the goal (or determined it cannot be achieve
         else:
             logging.info(f"[Attempt {attempt_id}] No changes to commit")
 
+        # If successful, merge attempt branch into goal's working branch
+        if outcome == "success" and goal_working_branch:
+            logging.info(f"[Attempt {attempt_id}] Merging {branch_name} into {goal_working_branch}")
+            try:
+                git_manager.merge_branch(branch_name, goal_working_branch, no_ff=True)
+                logging.info(f"[Attempt {attempt_id}] ✓ Merged successfully")
+            except subprocess.CalledProcessError as e:
+                logging.error(f"[Attempt {attempt_id}] Failed to merge: {e}")
+                # Update outcome to error since merge failed
+                outcome = "error"
+                failure_reason = f"Merge failed: {e}"
+
         # Update attempt with outcome
         update_attempt_outcome(db, attempt_id, outcome, failure_reason)
 
         return {
-            'success': True,
+            'success': outcome == "success",
             'attempt_id': attempt_id,
             'actions': actions,
             'outcome': outcome,
-            'response_text': response_text
+            'response_text': response_text,
+            'attempt_branch': branch_name
         }
 
     except ToolLimitExceeded as e:
@@ -1317,7 +1429,8 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             'attempt_id': attempt_id,
             'actions': actions,
             'outcome': "tool_limit_exceeded",
-            'error': str(e)
+            'error': str(e),
+            'attempt_branch': branch_name if 'branch_name' in locals() else None
         }
 
     except Exception as e:
@@ -1344,7 +1457,8 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             'attempt_id': attempt_id,
             'actions': actions,
             'outcome': "error",
-            'error': str(e)
+            'error': str(e),
+            'attempt_branch': branch_name if 'branch_name' in locals() else None
         }
 
     finally:
@@ -1399,55 +1513,91 @@ def decompose_goal(db, goal_id, attempt_result, model_id="openrouter/anthropic/c
 Break this goal down into 3-5 concrete, actionable sub-goals that:
 1. Are smaller in scope (achievable in <20 tool calls each)
 2. Build toward achieving the original goal
-3. Can be worked on independently when possible
-4. Are specific and testable
+3. Build on each other sequentially (each sub-goal uses the results of previous ones)
+4. Include validation commands to verify success
+
+**Important:**
+- Use MODULE.bazel with bzlmod, NOT WORKSPACE files
+- Each sub-goal should have concrete validation commands
 
 **Output format:**
-Return ONLY a numbered list of sub-goals, one per line:
-1. First sub-goal description
-2. Second sub-goal description
-3. Third sub-goal description
-...
-
-Each sub-goal should be a complete sentence describing what needs to be done."""
+Return ONLY valid JSON (no markdown, no code blocks):
+[
+  {{
+    "description": "Create MODULE.bazel with rules_python dependency",
+    "validation": [
+      {{"command": "bazel query //...", "expect": "success"}},
+      {{"command": "test -f MODULE.bazel", "expect": "success"}}
+    ]
+  }},
+  {{
+    "description": "Create BUILD files for Python sources",
+    "validation": [
+      {{"command": "bazel build //...", "expect": "success"}}
+    ]
+  }}
+]"""
 
     # Get LLM to decompose
     model = llm.get_model(model_id)
     response = model.prompt(decomposition_prompt)
-    response_text = response.text()
+    response_text = response.text().strip()
 
     logging.debug(f"[Goal {goal_id}] Decomposition response: {response_text}")
 
-    # Parse the response to extract sub-goals
+    # Parse JSON response
     sub_goals = []
-    for line in response_text.strip().split('\n'):
-        line = line.strip()
-        # Match lines like "1. Goal description" or "1) Goal description"
-        if line and (line[0].isdigit() or line.startswith('-')):
-            # Remove leading number/bullet and clean up
-            goal_text = line.lstrip('0123456789.)-• ').strip()
-            if goal_text:
-                sub_goals.append(goal_text)
+    try:
+        # Try to extract fenced code block first
+        extracted = extract_fenced_code_block(response_text, last=False)
+        json_text = extracted if extracted else response_text
+
+        sub_goals_data = json.loads(json_text)
+
+        if not isinstance(sub_goals_data, list):
+            raise ValueError("Expected JSON array")
+
+        sub_goals = sub_goals_data
+
+    except (json.JSONDecodeError, ValueError) as e:
+        logging.warning(f"[Goal {goal_id}] Failed to parse JSON response: {e}")
+        logging.warning(f"[Goal {goal_id}] Response was: {response_text[:200]}")
+        # Fallback: create a single retry goal
+        sub_goals = [{
+            "description": f"Retry: {goal_description}",
+            "validation": []
+        }]
 
     if not sub_goals:
-        logging.warning(f"[Goal {goal_id}] Failed to parse sub-goals from LLM response")
-        # Fallback: create a single retry goal
-        sub_goals = [f"Retry: {goal_description}"]
+        logging.warning(f"[Goal {goal_id}] No sub-goals in response")
+        sub_goals = [{
+            "description": f"Retry: {goal_description}",
+            "validation": []
+        }]
 
     logging.info(f"[Goal {goal_id}] Created {len(sub_goals)} sub-goals")
 
     # Create sub-goal records in database
     sub_goal_ids = []
-    for i, sub_goal_desc in enumerate(sub_goals, 1):
+    for i, sub_goal_data in enumerate(sub_goals, 1):
+        description = sub_goal_data.get('description', f'Sub-goal {i}')
+        validation = sub_goal_data.get('validation', [])
+
+        # Store validation commands as JSON
+        validation_json = json.dumps(validation) if validation else None
+
         sub_goal_id = create_goal(
             db,
-            description=sub_goal_desc,
+            description=description,
             parent_id=goal_id,
             goal_type='implementation',
-            created_by_goal_id=goal_id
+            created_by_goal_id=goal_id,
+            validation_commands=validation_json
         )
         sub_goal_ids.append(sub_goal_id)
-        logging.info(f"  Sub-goal {i}/{len(sub_goals)} (ID: {sub_goal_id}): {sub_goal_desc[:80]}")
+        logging.info(f"  Sub-goal {i}/{len(sub_goals)} (ID: {sub_goal_id}): {description[:80]}")
+        if validation:
+            logging.debug(f"    Validation: {len(validation)} commands")
 
     # Mark parent goal as decomposed
     update_goal_status(db, goal_id, 'decomposed')
@@ -1459,7 +1609,8 @@ Each sub-goal should be a complete sentence describing what needs to be done."""
 # Work Orchestration
 # ============================================================================
 
-def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, depth=0, max_depth=5):
+def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, depth=0, max_depth=5,
+                          parent_working_branch=None):
     """
     Work on a goal recursively: try once, decompose if needed, work on sub-goals.
 
@@ -1472,6 +1623,7 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
         model_id: LLM model ID
         depth: Current recursion depth
         max_depth: Maximum recursion depth
+        parent_working_branch: Parent goal's working branch (None for root goal)
 
     Returns:
         bool: True if goal completed successfully
@@ -1488,8 +1640,45 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
         update_goal_status(db, goal_id, 'failed')
         return False
 
-    # Mark goal as in progress
-    update_goal_status(db, goal_id, 'in_progress')
+    # Create or get goal's working branch
+    git_manager = GitManager(os.path.abspath(repo_path))
+
+    if goal['git_branch']:
+        # Use existing branch
+        goal_working_branch = goal['git_branch']
+        logging.debug(f"{indent}[Goal {goal_id}] Using existing branch: {goal_working_branch}")
+    else:
+        # Create new branch for this goal
+        if parent_working_branch:
+            base = parent_working_branch
+        else:
+            # Root goal - use session base branch
+            session_record = get_session_record(db)
+            base = session_record['base_branch']
+
+        goal_working_branch = f"goal-{goal_id}"
+        logging.info(f"{indent}[Goal {goal_id}] Creating working branch: {goal_working_branch} from {base}")
+
+        # Create the branch
+        subprocess.run(
+            ['git', 'checkout', base],
+            cwd=repo_path,
+            check=True,
+            capture_output=True
+        )
+        subprocess.run(
+            ['git', 'checkout', '-b', goal_working_branch],
+            cwd=repo_path,
+            check=True,
+            capture_output=True
+        )
+
+        # Store branch in database
+        update_goal_status(db, goal_id, 'in_progress', git_branch=goal_working_branch)
+
+    # Mark goal as in progress (if not already done above)
+    if goal['status'] != 'in_progress':
+        update_goal_status(db, goal_id, 'in_progress')
 
     # Make one attempt
     result = work_on_goal(
@@ -1498,7 +1687,8 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
         repo_path=repo_path,
         image=image,
         runtime=runtime,
-        model_id=model_id
+        model_id=model_id,
+        goal_working_branch=goal_working_branch
     )
 
     # Handle the outcome
@@ -1508,17 +1698,29 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
         return True
 
     else:
-        # Not successful - decompose and work on sub-goals
-        logging.info(f"{indent}[Goal {goal_id}] Outcome: {result['outcome']} - decomposing...")
+        # Not successful - check if we should decompose
+        # Only decompose root goals (goals without parents)
+        # Sub-goals that fail should not be decomposed further
+        if goal['parent_id'] is None:
+            # Root goal - decompose and work on sub-goals
+            logging.info(f"{indent}[Goal {goal_id}] Outcome: {result['outcome']} - decomposing...")
 
-        sub_goal_ids = decompose_goal(db, goal_id, result, model_id=model_id)
+            sub_goal_ids = decompose_goal(db, goal_id, result, model_id=model_id)
 
-        if not sub_goal_ids:
-            logging.warning(f"{indent}[Goal {goal_id}] No sub-goals created - marking as failed")
+            if not sub_goal_ids:
+                logging.warning(f"{indent}[Goal {goal_id}] No sub-goals created - marking as failed")
+                update_goal_status(db, goal_id, 'failed')
+                return False
+        else:
+            # Sub-goal failed - don't decompose further, just fail
+            logging.warning(f"{indent}[Goal {goal_id}] Sub-goal failed with outcome: {result['outcome']}")
+            logging.warning(f"{indent}[Goal {goal_id}] Not decomposing (sub-goals don't decompose) - marking as failed")
             update_goal_status(db, goal_id, 'failed')
             return False
 
-        # Work on each sub-goal
+        # Work on each sub-goal sequentially
+        # Each sub-goal branches from parent's working branch,
+        # and successful attempts are merged back into it
         all_succeeded = True
         for i, sub_goal_id in enumerate(sub_goal_ids, 1):
             logging.info(f"{indent}[Goal {goal_id}] Working on sub-goal {i}/{len(sub_goal_ids)}")
@@ -1531,12 +1733,15 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
                 runtime=runtime,
                 model_id=model_id,
                 depth=depth + 1,
-                max_depth=max_depth
+                max_depth=max_depth,
+                parent_working_branch=goal_working_branch  # Sub-goals build on parent's branch
             )
 
             if not success:
                 all_succeeded = False
                 logging.warning(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} failed")
+            else:
+                logging.info(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} succeeded - changes merged into {goal_working_branch}")
 
         # Update parent goal status based on sub-goals
         if all_succeeded:
