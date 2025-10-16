@@ -454,6 +454,26 @@ class GitManager:
 # Container Management
 # ============================================================================
 
+def detect_container_runtime():
+    """
+    Detect which container runtime is available.
+    Returns 'container' or 'docker', or raises RuntimeError if neither found.
+    """
+    for runtime in ['container', 'docker']:
+        try:
+            subprocess.run(
+                [runtime, '--version'],
+                check=True,
+                capture_output=True,
+                timeout=5
+            )
+            return runtime
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+    raise RuntimeError("No container runtime found. Please install 'container' or 'docker'.")
+
+
 class ContainerManager:
     """Manages container lifecycle for executing attempts"""
 
@@ -480,11 +500,14 @@ class ContainerManager:
         Returns:
             container_id
         """
+        # Convert to absolute path for container mount
+        abs_worktree_path = os.path.abspath(worktree_path)
+
         cmd = [
             self.runtime, 'run',
             '-d',  # Detached
             '--rm',  # Auto-remove when stopped
-            '-v', f'{worktree_path}:/workspace',
+            '-v', f'{abs_worktree_path}:/workspace',
             '-w', '/workspace',
         ]
 
@@ -1059,8 +1082,9 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
     session_record = get_session_record(db)
     base_branch = session_record['base_branch']
 
-    # Initialize managers
-    git_manager = GitManager(repo_path)
+    # Initialize managers (use absolute path)
+    abs_repo_path = os.path.abspath(repo_path)
+    git_manager = GitManager(abs_repo_path)
 
     # Create attempt record first so we can derive branch/worktree names
     attempt_id = create_attempt(db, goal_id=goal_id)
@@ -1321,6 +1345,18 @@ def main():
         help='List all sessions'
     )
 
+    # Configuration options
+    parser.add_argument(
+        '--model',
+        default='openrouter/anthropic/claude-haiku-4.5',
+        help='LLM model to use (default: openrouter/anthropic/claude-haiku-4.5)'
+    )
+    parser.add_argument(
+        '--image',
+        default='shots-on-goal:latest',
+        help='Container image to use (default: shots-on-goal:latest)'
+    )
+
     args = parser.parse_args()
 
     # Handle list command
@@ -1359,11 +1395,51 @@ def main():
     root_goal_id = create_goal(db, args.goal)
     print(f"Created root goal: {args.goal} (ID: {root_goal_id})")
 
-    # TODO: Start working on the root goal
-    print("\nReady to start working on goal...")
-    print("(Work loop not yet implemented)")
+    # Start working on the root goal
+    print("\n" + "=" * 80)
+    print("Starting work on goal...")
+    print("=" * 80 + "\n")
 
-    db.close()
+    try:
+        result = work_on_goal(
+            db=db,
+            goal_id=root_goal_id,
+            repo_path=str(repo_path),
+            image=args.image,
+            runtime=detect_container_runtime(),
+            model_id=args.model
+        )
+
+        print("\n" + "=" * 80)
+        print("Goal attempt completed!")
+        print("=" * 80)
+        print(f"\nAttempt ID: {result['attempt_id']}")
+        print(f"Outcome: {result['outcome']}")
+        print(f"Tools used: {len(result['actions'])}")
+
+        if result.get('response_text'):
+            print(f"\n--- LLM Response ---")
+            print(result['response_text'])
+            print("--- End Response ---\n")
+
+        if result['outcome'] == 'success':
+            print("✓ Goal attempt succeeded!")
+        else:
+            print("✗ Goal attempt failed")
+            if result.get('error'):
+                print(f"Error: {result['error']}")
+
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user. Session saved.")
+        update_session_status(db, 'interrupted')
+    except Exception as e:
+        print(f"\n\nError during execution: {e}")
+        update_session_status(db, 'failed')
+        raise
+    finally:
+        db.close()
+
+    print(f"\nSession saved to: {session_dir}")
 
 
 if __name__ == "__main__":
