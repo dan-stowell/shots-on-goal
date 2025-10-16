@@ -9,6 +9,7 @@ makes changes, and validates them.
 import argparse
 import os
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -249,6 +250,279 @@ def get_actions(db, attempt_id):
         (attempt_id,)
     )
     return cursor.fetchall()
+
+
+# ============================================================================
+# Git Management
+# ============================================================================
+
+class GitManager:
+    """Manages git operations for goals and attempts using worktrees"""
+
+    def __init__(self, repo_path):
+        self.repo_path = Path(repo_path)
+        self.worktrees_dir = self.repo_path / "worktrees"
+        self.worktrees_dir.mkdir(exist_ok=True)
+
+    def create_session_branch(self, session_id, base_branch='main'):
+        """
+        Create a session branch from base branch.
+        Returns: branch_name
+        """
+        branch_name = f"session-{session_id}"
+
+        # Create and checkout session branch
+        subprocess.run(
+            ['git', 'checkout', '-b', branch_name, base_branch],
+            cwd=self.repo_path,
+            check=True,
+            capture_output=True
+        )
+
+        return branch_name
+
+    def create_goal_branch(self, goal_id, parent_branch):
+        """
+        Create a goal branch from parent branch.
+        Returns: branch_name
+        """
+        branch_name = f"goal-{goal_id}"
+
+        subprocess.run(
+            ['git', 'checkout', parent_branch],
+            cwd=self.repo_path,
+            check=True,
+            capture_output=True
+        )
+
+        subprocess.run(
+            ['git', 'checkout', '-b', branch_name],
+            cwd=self.repo_path,
+            check=True,
+            capture_output=True
+        )
+
+        return branch_name
+
+    def create_worktree_for_attempt(self, goal_id, attempt_id, base_branch):
+        """
+        Create a worktree with a new branch for an attempt.
+        Returns: (worktree_path, branch_name, commit_sha)
+        """
+        branch_name = f"goal-{goal_id}-attempt-{attempt_id}"
+        worktree_path = self.worktrees_dir / branch_name
+
+        # Create worktree with new branch based on base_branch
+        subprocess.run(
+            ['git', 'worktree', 'add', str(worktree_path), '-b', branch_name, base_branch],
+            cwd=self.repo_path,
+            check=True,
+            capture_output=True
+        )
+
+        # Get the commit SHA
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=worktree_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        commit_sha = result.stdout.strip()
+
+        return str(worktree_path), branch_name, commit_sha
+
+    def get_current_commit_sha(self, path=None):
+        """
+        Get the current commit SHA at path (or repo root if not specified).
+        Returns: commit_sha
+        """
+        target_path = path if path else self.repo_path
+
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=target_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        return result.stdout.strip()
+
+    def merge_branch(self, source_branch, target_branch, no_ff=True):
+        """
+        Merge source branch into target branch.
+        """
+        # Checkout target branch
+        subprocess.run(
+            ['git', 'checkout', target_branch],
+            cwd=self.repo_path,
+            check=True,
+            capture_output=True
+        )
+
+        # Merge with --no-ff to preserve history
+        merge_cmd = ['git', 'merge', source_branch]
+        if no_ff:
+            merge_cmd.insert(2, '--no-ff')
+
+        subprocess.run(
+            merge_cmd,
+            cwd=self.repo_path,
+            check=True,
+            capture_output=True
+        )
+
+    def remove_worktree(self, worktree_path):
+        """
+        Remove a worktree directory.
+        """
+        subprocess.run(
+            ['git', 'worktree', 'remove', str(worktree_path)],
+            cwd=self.repo_path,
+            check=True,
+            capture_output=True
+        )
+
+    def list_worktrees(self):
+        """
+        List all worktrees.
+        Returns: list of worktree info dicts
+        """
+        result = subprocess.run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=self.repo_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+
+        worktrees = []
+        current_worktree = {}
+
+        for line in result.stdout.split('\n'):
+            if not line:
+                if current_worktree:
+                    worktrees.append(current_worktree)
+                    current_worktree = {}
+                continue
+
+            if line.startswith('worktree '):
+                current_worktree['path'] = line.split(' ', 1)[1]
+            elif line.startswith('branch '):
+                current_worktree['branch'] = line.split(' ', 1)[1]
+            elif line.startswith('HEAD '):
+                current_worktree['commit'] = line.split(' ', 1)[1]
+
+        # Append the last worktree if there's no trailing blank line
+        if current_worktree:
+            worktrees.append(current_worktree)
+
+        return worktrees
+
+
+# ============================================================================
+# Container Management
+# ============================================================================
+
+class ContainerManager:
+    """Manages container lifecycle for executing attempts"""
+
+    def __init__(self, image="ubuntu:22.04", runtime="container"):
+        """
+        Initialize container manager.
+
+        Args:
+            image: Container image to use
+            runtime: Container runtime command ('container' or 'docker')
+        """
+        self.image = image
+        self.runtime = runtime
+        self.container_id = None
+
+    def start(self, worktree_path, shared_cache_dir=None):
+        """
+        Start a container with worktree mounted.
+
+        Args:
+            worktree_path: Path to worktree to mount at /workspace
+            shared_cache_dir: Optional shared cache directory (e.g., for bazel)
+
+        Returns:
+            container_id
+        """
+        cmd = [
+            self.runtime, 'run',
+            '-d',  # Detached
+            '--rm',  # Auto-remove when stopped
+            '-v', f'{worktree_path}:/workspace',
+            '-w', '/workspace',
+        ]
+
+        # Add shared cache mount if specified
+        if shared_cache_dir:
+            cmd.extend(['-v', f'{shared_cache_dir}:/root/.cache'])
+
+        # Image and command
+        cmd.extend([self.image, 'sleep', 'infinity'])
+
+        result = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+
+        self.container_id = result.stdout.strip()
+        return self.container_id
+
+    def exec(self, command, timeout=None):
+        """
+        Execute a command in the container.
+
+        Args:
+            command: Shell command to execute
+            timeout: Optional timeout in seconds
+
+        Returns:
+            subprocess.CompletedProcess with stdout, stderr, returncode
+        """
+        if not self.container_id:
+            raise RuntimeError("Container not started")
+
+        cmd = [
+            self.runtime, 'exec',
+            '-w', '/workspace',
+            self.container_id,
+            'bash', '-c', command
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+
+        return result
+
+    def stop(self):
+        """Stop and remove the container"""
+        if self.container_id:
+            subprocess.run(
+                [self.runtime, 'stop', self.container_id],
+                check=False,  # Don't fail if already stopped
+                capture_output=True
+            )
+            self.container_id = None
+
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - stop container"""
+        self.stop()
+        return False
 
 
 # ============================================================================

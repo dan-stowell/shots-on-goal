@@ -387,6 +387,247 @@ class TestSessionManagement(unittest.TestCase):
         loaded_db.close()
 
 
+class TestGitManager(unittest.TestCase):
+    """Test git operations and worktree management"""
+
+    def setUp(self):
+        """Create temporary git repository for testing"""
+        self.temp_dir = tempfile.mkdtemp()
+        self.repo_dir = Path(self.temp_dir) / "test-repo"
+        self.repo_dir.mkdir()
+
+        # Initialize git repo
+        subprocess.run(['git', 'init'], cwd=self.repo_dir, check=True,
+                      capture_output=True)
+        subprocess.run(['git', 'config', 'user.email', 'test@example.com'],
+                      cwd=self.repo_dir, check=True, capture_output=True)
+        subprocess.run(['git', 'config', 'user.name', 'Test User'],
+                      cwd=self.repo_dir, check=True, capture_output=True)
+
+        # Create initial commit
+        (self.repo_dir / "README.md").write_text("# Test Repo\n")
+        subprocess.run(['git', 'add', '.'], cwd=self.repo_dir, check=True,
+                      capture_output=True)
+        subprocess.run(['git', 'commit', '-m', 'Initial commit'],
+                      cwd=self.repo_dir, check=True, capture_output=True)
+
+        self.git_mgr = shots_on_goal.GitManager(str(self.repo_dir))
+
+    def tearDown(self):
+        """Clean up temporary files"""
+        shutil.rmtree(self.temp_dir)
+
+    def test_create_session_branch(self):
+        """Test creating a session branch"""
+        branch_name = self.git_mgr.create_session_branch('20251016-100000')
+        self.assertEqual(branch_name, 'session-20251016-100000')
+
+        # Verify branch exists
+        result = subprocess.run(
+            ['git', 'branch', '--list', branch_name],
+            cwd=self.repo_dir,
+            capture_output=True,
+            text=True
+        )
+        self.assertIn(branch_name, result.stdout)
+
+    def test_create_goal_branch(self):
+        """Test creating a goal branch"""
+        # Create session branch first
+        session_branch = self.git_mgr.create_session_branch('20251016-100000')
+
+        # Create goal branch from session branch
+        goal_branch = self.git_mgr.create_goal_branch(1, session_branch)
+        self.assertEqual(goal_branch, 'goal-1')
+
+        # Verify branch exists
+        result = subprocess.run(
+            ['git', 'branch', '--list', goal_branch],
+            cwd=self.repo_dir,
+            capture_output=True,
+            text=True
+        )
+        self.assertIn(goal_branch, result.stdout)
+
+    def test_create_worktree_for_attempt(self):
+        """Test creating a worktree for an attempt"""
+        session_branch = self.git_mgr.create_session_branch('20251016-100000')
+
+        worktree_path, branch_name, commit_sha = \
+            self.git_mgr.create_worktree_for_attempt(1, 1, session_branch)
+
+        # Check return values
+        self.assertIn('goal-1-attempt-1', worktree_path)
+        self.assertEqual(branch_name, 'goal-1-attempt-1')
+        self.assertTrue(len(commit_sha) == 40)  # SHA is 40 chars
+
+        # Verify worktree exists
+        worktree_path_obj = Path(worktree_path)
+        self.assertTrue(worktree_path_obj.exists())
+        self.assertTrue((worktree_path_obj / "README.md").exists())
+
+    def test_get_current_commit_sha(self):
+        """Test getting current commit SHA"""
+        commit_sha = self.git_mgr.get_current_commit_sha()
+        self.assertTrue(len(commit_sha) == 40)
+
+    def test_merge_branch(self):
+        """Test merging branches"""
+        # Create two branches
+        session_branch = self.git_mgr.create_session_branch('20251016-100000')
+        goal_branch = self.git_mgr.create_goal_branch(1, session_branch)
+
+        # Make a change in goal branch
+        (self.repo_dir / "test.txt").write_text("test content")
+        subprocess.run(['git', 'add', '.'], cwd=self.repo_dir, check=True,
+                      capture_output=True)
+        subprocess.run(['git', 'commit', '-m', 'Add test file'],
+                      cwd=self.repo_dir, check=True, capture_output=True)
+
+        # Merge goal branch back to session branch
+        self.git_mgr.merge_branch(goal_branch, session_branch)
+
+        # Verify file exists in session branch
+        subprocess.run(['git', 'checkout', session_branch],
+                      cwd=self.repo_dir, check=True, capture_output=True)
+        self.assertTrue((self.repo_dir / "test.txt").exists())
+
+    def test_remove_worktree(self):
+        """Test removing a worktree"""
+        session_branch = self.git_mgr.create_session_branch('20251016-100000')
+        worktree_path, _, _ = self.git_mgr.create_worktree_for_attempt(
+            1, 1, session_branch
+        )
+
+        # Worktree should exist
+        self.assertTrue(Path(worktree_path).exists())
+
+        # Remove it
+        self.git_mgr.remove_worktree(worktree_path)
+
+        # Worktree should no longer exist
+        self.assertFalse(Path(worktree_path).exists())
+
+    def test_list_worktrees(self):
+        """Test listing worktrees"""
+        session_branch = self.git_mgr.create_session_branch('20251016-100000')
+
+        # Create a couple worktrees
+        self.git_mgr.create_worktree_for_attempt(1, 1, session_branch)
+        self.git_mgr.create_worktree_for_attempt(1, 2, session_branch)
+
+        worktrees = self.git_mgr.list_worktrees()
+
+        # Should have exactly 3: main repo + 2 worktrees
+        self.assertEqual(len(worktrees), 3,
+                        f"Expected 3 worktrees but got {len(worktrees)}: {worktrees}")
+
+        # Find our worktrees
+        worktree_branches = [w.get('branch', '') for w in worktrees]
+        self.assertIn('refs/heads/goal-1-attempt-1', worktree_branches)
+        self.assertIn('refs/heads/goal-1-attempt-2', worktree_branches)
+
+
+class TestContainerManager(unittest.TestCase):
+    """Test container management"""
+
+    def setUp(self):
+        """Check if container runtime is available"""
+        self.temp_dir = tempfile.mkdtemp()
+
+        # Try to detect container runtime
+        self.runtime = None
+        for cmd in ['container', 'docker']:
+            try:
+                subprocess.run([cmd, '--version'], check=True,
+                             capture_output=True)
+                self.runtime = cmd
+                break
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+
+        if not self.runtime:
+            self.skipTest("No container runtime (container or docker) available")
+
+    def tearDown(self):
+        """Clean up temporary files"""
+        shutil.rmtree(self.temp_dir)
+
+    def test_container_start_stop(self):
+        """Test starting and stopping a container"""
+        # Create a test workspace
+        workspace = Path(self.temp_dir) / "workspace"
+        workspace.mkdir()
+        (workspace / "test.txt").write_text("hello")
+
+        container = shots_on_goal.ContainerManager(
+            image="ubuntu:22.04",
+            runtime=self.runtime
+        )
+
+        # Start container
+        container_id = container.start(str(workspace))
+        self.assertIsNotNone(container_id)
+        self.assertTrue(len(container_id) > 0)
+
+        # Stop container
+        container.stop()
+        self.assertIsNone(container.container_id)
+
+    def test_container_exec(self):
+        """Test executing commands in container"""
+        workspace = Path(self.temp_dir) / "workspace"
+        workspace.mkdir()
+        (workspace / "test.txt").write_text("hello world")
+
+        container = shots_on_goal.ContainerManager(
+            image="ubuntu:22.04",
+            runtime=self.runtime
+        )
+
+        try:
+            container.start(str(workspace))
+
+            # Execute command to read file
+            result = container.exec("cat test.txt")
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout.strip(), "hello world")
+
+            # Execute command that fails
+            result = container.exec("cat nonexistent.txt")
+            self.assertNotEqual(result.returncode, 0)
+
+        finally:
+            container.stop()
+
+    def test_container_context_manager(self):
+        """Test using container as context manager"""
+        workspace = Path(self.temp_dir) / "workspace"
+        workspace.mkdir()
+
+        with shots_on_goal.ContainerManager(
+            image="ubuntu:22.04",
+            runtime=self.runtime
+        ) as container:
+            container.start(str(workspace))
+            self.assertIsNotNone(container.container_id)
+
+            # Execute a command
+            result = container.exec("pwd")
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("workspace", result.stdout)
+
+        # Container should be stopped after exiting context
+        self.assertIsNone(container.container_id)
+
+    def test_exec_without_start_raises_error(self):
+        """Test that exec raises error if container not started"""
+        container = shots_on_goal.ContainerManager(runtime=self.runtime)
+
+        with self.assertRaises(RuntimeError):
+            container.exec("echo hello")
+
+
 def run_tests():
     """Run all tests"""
     loader = unittest.TestLoader()
@@ -399,6 +640,8 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestAttempts))
     suite.addTests(loader.loadTestsFromTestCase(TestActions))
     suite.addTests(loader.loadTestsFromTestCase(TestSessionManagement))
+    suite.addTests(loader.loadTestsFromTestCase(TestGitManager))
+    suite.addTests(loader.loadTestsFromTestCase(TestContainerManager))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
