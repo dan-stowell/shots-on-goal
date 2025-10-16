@@ -863,29 +863,27 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
     # Create attempt record first so we can derive branch/worktree names
     attempt_id = create_attempt(db, goal_id=goal_id)
 
-    # Create worktree for the attempt using the real attempt ID
-    worktree_path, branch_name, commit_sha = git_manager.create_worktree_for_attempt(
-        goal_id,
-        attempt_id=attempt_id,
-        base_branch=base_branch
-    )
-
-    # Persist metadata we already know
-    update_attempt_metadata(
-        db,
-        attempt_id,
-        git_branch=branch_name,
-        worktree_path=worktree_path,
-        git_commit_sha=commit_sha
-    )
-
-    # Start container
-    container = ContainerManager(image=image, runtime=runtime)
-
     # Initialize variables for exception handling
     actions = []
+    container = ContainerManager(image=image, runtime=runtime)
 
     try:
+        # Create worktree for the attempt using the real attempt ID
+        worktree_path, branch_name, commit_sha = git_manager.create_worktree_for_attempt(
+            goal_id,
+            attempt_id=attempt_id,
+            base_branch=base_branch
+        )
+
+        # Persist metadata we already know
+        update_attempt_metadata(
+            db,
+            attempt_id,
+            git_branch=branch_name,
+            worktree_path=worktree_path,
+            git_commit_sha=commit_sha
+        )
+
         container_id = container.start(worktree_path)
 
         # Record container ID once the container is running
