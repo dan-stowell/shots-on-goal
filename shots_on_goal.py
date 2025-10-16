@@ -1354,6 +1354,202 @@ When you have successfully achieved the goal (or determined it cannot be achieve
 
 
 # ============================================================================
+# Goal Decomposition
+# ============================================================================
+
+def decompose_goal(db, goal_id, attempt_result, model_id="openrouter/anthropic/claude-haiku-4.5"):
+    """
+    Decompose a goal into sub-goals using LLM.
+
+    Args:
+        db: Database connection
+        goal_id: Goal ID that needs decomposition
+        attempt_result: Result dict from work_on_goal()
+        model_id: LLM model to use
+
+    Returns:
+        List of sub-goal IDs created
+    """
+    goal = get_goal(db, goal_id)
+    goal_description = goal['description']
+    outcome = attempt_result['outcome']
+    actions = attempt_result['actions']
+
+    logging.info(f"[Goal {goal_id}] Decomposing goal after outcome: {outcome}")
+
+    # Build context about what was attempted
+    tools_used = [action['tool'] for action in actions]
+    tool_summary = ", ".join(set(tools_used[:10]))  # First 10 unique tools
+
+    # Prompt for decomposition
+    decomposition_prompt = f"""A goal attempt did not succeed. Analyze the situation and break down the goal into smaller, concrete sub-goals.
+
+**Original Goal:**
+{goal_description}
+
+**Attempt Outcome:**
+{outcome}
+
+**What was tried:**
+- {len(actions)} tool calls were made
+- Tools used: {tool_summary}
+{f"- Error: {attempt_result.get('error', 'N/A')}" if outcome == 'error' else ''}
+
+**Your task:**
+Break this goal down into 3-5 concrete, actionable sub-goals that:
+1. Are smaller in scope (achievable in <20 tool calls each)
+2. Build toward achieving the original goal
+3. Can be worked on independently when possible
+4. Are specific and testable
+
+**Output format:**
+Return ONLY a numbered list of sub-goals, one per line:
+1. First sub-goal description
+2. Second sub-goal description
+3. Third sub-goal description
+...
+
+Each sub-goal should be a complete sentence describing what needs to be done."""
+
+    # Get LLM to decompose
+    model = llm.get_model(model_id)
+    response = model.prompt(decomposition_prompt)
+    response_text = response.text()
+
+    logging.debug(f"[Goal {goal_id}] Decomposition response: {response_text}")
+
+    # Parse the response to extract sub-goals
+    sub_goals = []
+    for line in response_text.strip().split('\n'):
+        line = line.strip()
+        # Match lines like "1. Goal description" or "1) Goal description"
+        if line and (line[0].isdigit() or line.startswith('-')):
+            # Remove leading number/bullet and clean up
+            goal_text = line.lstrip('0123456789.)-• ').strip()
+            if goal_text:
+                sub_goals.append(goal_text)
+
+    if not sub_goals:
+        logging.warning(f"[Goal {goal_id}] Failed to parse sub-goals from LLM response")
+        # Fallback: create a single retry goal
+        sub_goals = [f"Retry: {goal_description}"]
+
+    logging.info(f"[Goal {goal_id}] Created {len(sub_goals)} sub-goals")
+
+    # Create sub-goal records in database
+    sub_goal_ids = []
+    for i, sub_goal_desc in enumerate(sub_goals, 1):
+        sub_goal_id = create_goal(
+            db,
+            description=sub_goal_desc,
+            parent_id=goal_id,
+            goal_type='implementation',
+            created_by_goal_id=goal_id
+        )
+        sub_goal_ids.append(sub_goal_id)
+        logging.info(f"  Sub-goal {i}/{len(sub_goals)} (ID: {sub_goal_id}): {sub_goal_desc[:80]}")
+
+    # Mark parent goal as decomposed
+    update_goal_status(db, goal_id, 'decomposed')
+
+    return sub_goal_ids
+
+
+# ============================================================================
+# Work Orchestration
+# ============================================================================
+
+def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, depth=0, max_depth=5):
+    """
+    Work on a goal recursively: try once, decompose if needed, work on sub-goals.
+
+    Args:
+        db: Database connection
+        goal_id: Goal ID to work on
+        repo_path: Path to repository
+        image: Container image
+        runtime: Container runtime
+        model_id: LLM model ID
+        depth: Current recursion depth
+        max_depth: Maximum recursion depth
+
+    Returns:
+        bool: True if goal completed successfully
+    """
+    indent = "  " * depth
+    goal = get_goal(db, goal_id)
+    goal_desc = goal['description'][:80]
+
+    logging.info(f"{indent}[Goal {goal_id}] Working on: {goal_desc}")
+
+    # Check depth limit
+    if depth >= max_depth:
+        logging.warning(f"{indent}[Goal {goal_id}] Max depth ({max_depth}) reached - marking as failed")
+        update_goal_status(db, goal_id, 'failed')
+        return False
+
+    # Mark goal as in progress
+    update_goal_status(db, goal_id, 'in_progress')
+
+    # Make one attempt
+    result = work_on_goal(
+        db=db,
+        goal_id=goal_id,
+        repo_path=repo_path,
+        image=image,
+        runtime=runtime,
+        model_id=model_id
+    )
+
+    # Handle the outcome
+    if result['outcome'] == 'success':
+        logging.info(f"{indent}[Goal {goal_id}] ✓ Completed successfully")
+        update_goal_status(db, goal_id, 'completed')
+        return True
+
+    else:
+        # Not successful - decompose and work on sub-goals
+        logging.info(f"{indent}[Goal {goal_id}] Outcome: {result['outcome']} - decomposing...")
+
+        sub_goal_ids = decompose_goal(db, goal_id, result, model_id=model_id)
+
+        if not sub_goal_ids:
+            logging.warning(f"{indent}[Goal {goal_id}] No sub-goals created - marking as failed")
+            update_goal_status(db, goal_id, 'failed')
+            return False
+
+        # Work on each sub-goal
+        all_succeeded = True
+        for i, sub_goal_id in enumerate(sub_goal_ids, 1):
+            logging.info(f"{indent}[Goal {goal_id}] Working on sub-goal {i}/{len(sub_goal_ids)}")
+
+            success = work_on_goal_recursive(
+                db=db,
+                goal_id=sub_goal_id,
+                repo_path=repo_path,
+                image=image,
+                runtime=runtime,
+                model_id=model_id,
+                depth=depth + 1,
+                max_depth=max_depth
+            )
+
+            if not success:
+                all_succeeded = False
+                logging.warning(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} failed")
+
+        # Update parent goal status based on sub-goals
+        if all_succeeded:
+            logging.info(f"{indent}[Goal {goal_id}] ✓ All sub-goals completed - marking as completed")
+            update_goal_status(db, goal_id, 'completed')
+            return True
+        else:
+            logging.warning(f"{indent}[Goal {goal_id}] ✗ Some sub-goals failed - marking as failed")
+            update_goal_status(db, goal_id, 'failed')
+            return False
+
+
+# ============================================================================
 # Session Management
 # ============================================================================
 
@@ -1545,13 +1741,13 @@ def main():
     root_goal_id = create_goal(db, args.goal)
     logging.info(f"Created root goal (ID: {root_goal_id}): {args.goal}")
 
-    # Start working on the root goal
+    # Start working on the root goal (with decomposition)
     print("\n" + "=" * 80)
-    print("Starting work on goal...")
+    print("Starting work on goal (with recursive decomposition)...")
     print("=" * 80 + "\n")
 
     try:
-        result = work_on_goal(
+        success = work_on_goal_recursive(
             db=db,
             goal_id=root_goal_id,
             repo_path=str(repo_path),
@@ -1561,29 +1757,32 @@ def main():
         )
 
         print("\n" + "=" * 80)
-        print("Goal attempt completed!")
+        print("Goal tree completed!")
         print("=" * 80)
-        print(f"\nAttempt ID: {result['attempt_id']}")
-        print(f"Outcome: {result['outcome']}")
-        print(f"Tools used: {len(result['actions'])}")
 
-        if result.get('response_text'):
-            print(f"\n--- LLM Response ---")
-            print(result['response_text'])
-            print("--- End Response ---\n")
+        # Get final status
+        final_goal = get_goal(db, root_goal_id)
+        print(f"\nRoot goal status: {final_goal['status']}")
 
-        if result['outcome'] == 'success':
-            print("✓ Goal attempt succeeded!")
-        elif result['outcome'] == 'tool_limit_exceeded':
-            print("⚠ Tool limit exceeded - goal may need decomposition")
-        elif result['outcome'] == 'error':
-            print("✗ Goal attempt failed with error")
-            if result.get('error'):
-                print(f"Error: {result['error']}")
+        if success:
+            print("✓ Root goal completed successfully!")
         else:
-            print(f"• Goal attempt outcome: {result['outcome']}")
-            if result.get('error'):
-                print(f"Details: {result['error']}")
+            print("✗ Root goal did not complete successfully")
+
+        # Show goal tree summary
+        print("\n--- Goal Tree Summary ---")
+        all_goals = db.execute("SELECT id, description, status, parent_id FROM goals ORDER BY id").fetchall()
+        for goal in all_goals:
+            depth = 0
+            parent_id = goal['parent_id']
+            while parent_id:
+                depth += 1
+                parent = get_goal(db, parent_id)
+                parent_id = parent['parent_id'] if parent else None
+
+            indent = "  " * depth
+            status_icon = "✓" if goal['status'] == 'completed' else ("✗" if goal['status'] == 'failed' else "•")
+            print(f"{indent}{status_icon} Goal {goal['id']}: {goal['description'][:60]} [{goal['status']}]")
 
     except KeyboardInterrupt:
         print("\n\nInterrupted by user. Session saved.")
