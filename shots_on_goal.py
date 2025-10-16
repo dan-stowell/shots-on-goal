@@ -1511,29 +1511,39 @@ def decompose_goal(db, goal_id, attempt_result, model_id="openrouter/anthropic/c
 
 **Your task:**
 Break this goal down into 3-5 concrete, actionable sub-goals that:
-1. Are smaller in scope (achievable in <20 tool calls each)
-2. Build toward achieving the original goal
-3. Build on each other sequentially (each sub-goal uses the results of previous ones)
-4. Include validation commands to verify success
+1. Are VERY SPECIFIC about what to create/modify (not exploratory or documentation tasks)
+2. Are smaller in scope (achievable in <20 tool calls each)
+3. Build toward achieving the original goal
+4. Build on each other sequentially (each sub-goal uses the results of previous ones)
+5. Have concrete validation commands that test functionality
+
+**What makes a good sub-goal:**
+✓ "Create MODULE.bazel with rules_python version 0.31.0"
+✓ "Write BUILD file in src/ to build mylib.py as py_library"
+✓ "Add py_binary target for main.py in root BUILD file"
+✗ "Explore the codebase structure" (too vague)
+✗ "Document the migration process" (not testable)
+✗ "Create comprehensive BUILD files" (too broad)
 
 **Important:**
 - Use MODULE.bazel with bzlmod, NOT WORKSPACE files
-- Each sub-goal should have concrete validation commands
+- Each sub-goal MUST have validation commands that test the build/functionality
+- Focus on making things buildable, not on documentation
 
 **Output format:**
-Return ONLY valid JSON (no markdown, no code blocks):
+Return ONLY valid JSON (you can wrap in ```json if you want):
 [
   {{
-    "description": "Create MODULE.bazel with rules_python dependency",
+    "description": "Create MODULE.bazel with rules_python version 0.31.0 and declare mylib module",
     "validation": [
-      {{"command": "bazel query //...", "expect": "success"}},
-      {{"command": "test -f MODULE.bazel", "expect": "success"}}
+      {{"command": "test -f MODULE.bazel", "expect": "success"}},
+      {{"command": "bazel query //...", "expect": "success"}}
     ]
   }},
   {{
-    "description": "Create BUILD files for Python sources",
+    "description": "Write BUILD file in src/ to build mylib.py as py_library target",
     "validation": [
-      {{"command": "bazel build //...", "expect": "success"}}
+      {{"command": "bazel build //src:mylib", "expect": "success"}}
     ]
   }}
 ]"""
@@ -1597,7 +1607,9 @@ Return ONLY valid JSON (no markdown, no code blocks):
         sub_goal_ids.append(sub_goal_id)
         logging.info(f"  Sub-goal {i}/{len(sub_goals)} (ID: {sub_goal_id}): {description[:80]}")
         if validation:
-            logging.debug(f"    Validation: {len(validation)} commands")
+            logging.info(f"    Validation: {len(validation)} commands")
+            for j, cmd in enumerate(validation, 1):
+                logging.info(f"      {j}. {cmd.get('command', 'N/A')}")
 
     # Mark parent goal as decomposed
     update_goal_status(db, goal_id, 'decomposed')
@@ -1721,6 +1733,7 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
         # Work on each sub-goal sequentially
         # Each sub-goal branches from parent's working branch,
         # and successful attempts are merged back into it
+        # STOP on first failure (fail-fast)
         all_succeeded = True
         for i, sub_goal_id in enumerate(sub_goal_ids, 1):
             logging.info(f"{indent}[Goal {goal_id}] Working on sub-goal {i}/{len(sub_goal_ids)}")
@@ -1739,7 +1752,8 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
 
             if not success:
                 all_succeeded = False
-                logging.warning(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} failed")
+                logging.warning(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} failed - stopping remaining sub-goals")
+                break  # Fail fast - don't process remaining sub-goals
             else:
                 logging.info(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} succeeded - changes merged into {goal_working_branch}")
 
