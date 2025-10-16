@@ -345,12 +345,17 @@ class GitManager:
 
         return branch_name
 
-    def create_worktree_for_attempt(self, goal_id, attempt_id, base_branch):
+    def create_worktree_for_attempt(self, goal_id, attempt_id, base_branch, session_id=None):
         """
         Create a worktree with a new branch for an attempt.
         Returns: (worktree_path, branch_name, commit_sha)
         """
-        branch_name = f"goal-{goal_id}-attempt-{attempt_id}"
+        # Include session_id for uniqueness across runs
+        if session_id:
+            branch_name = f"s{session_id}-g{goal_id}-a{attempt_id}"
+        else:
+            branch_name = f"goal-{goal_id}-attempt-{attempt_id}"
+
         worktree_path = self.worktrees_dir / branch_name
 
         # Create worktree with new branch based on base_branch
@@ -1150,6 +1155,7 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
     # Get session info for base branch
     session_record = get_session_record(db)
     base_branch = session_record['base_branch']
+    session_id = session_record['session_id']
 
     # Initialize managers (use absolute path)
     abs_repo_path = os.path.abspath(repo_path)
@@ -1167,7 +1173,8 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         worktree_path, branch_name, commit_sha = git_manager.create_worktree_for_attempt(
             goal_id,
             attempt_id=attempt_id,
-            base_branch=base_branch
+            base_branch=base_branch,
+            session_id=session_id
         )
 
         # Persist metadata we already know
