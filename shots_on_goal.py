@@ -526,6 +526,285 @@ class ContainerManager:
 
 
 # ============================================================================
+# Tool Execution
+# ============================================================================
+
+class ToolExecutor:
+    """Executes tools in a container with restricted, safe operations"""
+
+    def __init__(self, container):
+        """
+        Initialize with a container manager.
+
+        Args:
+            container: ContainerManager instance
+        """
+        self.container = container
+
+    # Bazel Tools
+
+    def bazel_build(self, targets="//...", flags=None):
+        """
+        Build Bazel targets.
+
+        Args:
+            targets: Bazel target pattern (default: //...)
+            flags: Optional list of additional bazel flags
+
+        Returns:
+            dict with 'success', 'stdout', 'stderr', 'exit_code'
+        """
+        cmd = f"bazel build {targets}"
+        if flags:
+            cmd += " " + " ".join(flags)
+
+        result = self.container.exec(cmd, timeout=600)
+
+        return {
+            'success': result.returncode == 0,
+            'stdout': result.stdout,
+            'stderr': result.stderr,
+            'exit_code': result.returncode
+        }
+
+    def bazel_test(self, targets="//...", flags=None):
+        """
+        Run Bazel tests.
+
+        Args:
+            targets: Bazel test target pattern (default: //...)
+            flags: Optional list of additional bazel flags
+
+        Returns:
+            dict with 'success', 'stdout', 'stderr', 'exit_code'
+        """
+        cmd = f"bazel test {targets}"
+        if flags:
+            cmd += " " + " ".join(flags)
+
+        result = self.container.exec(cmd, timeout=600)
+
+        return {
+            'success': result.returncode == 0,
+            'stdout': result.stdout,
+            'stderr': result.stderr,
+            'exit_code': result.returncode
+        }
+
+    def bazel_query(self, query):
+        """
+        Query the Bazel build graph.
+
+        Args:
+            query: Bazel query expression
+
+        Returns:
+            dict with 'success', 'stdout', 'stderr', 'exit_code'
+        """
+        # Escape quotes in query
+        query_escaped = query.replace('"', '\\"')
+        cmd = f'bazel query "{query_escaped}"'
+
+        result = self.container.exec(cmd, timeout=60)
+
+        return {
+            'success': result.returncode == 0,
+            'stdout': result.stdout,
+            'stderr': result.stderr,
+            'exit_code': result.returncode
+        }
+
+    # File Operations
+
+    def read_file(self, path):
+        """
+        Read a file from the workspace.
+
+        Args:
+            path: Path to file (relative to workspace root)
+
+        Returns:
+            dict with 'success', 'content', 'error'
+        """
+        # Use cat to read the file
+        result = self.container.exec(f"cat {path}", timeout=30)
+
+        if result.returncode == 0:
+            return {
+                'success': True,
+                'content': result.stdout,
+                'error': None
+            }
+        else:
+            return {
+                'success': False,
+                'content': None,
+                'error': result.stderr
+            }
+
+    def write_file(self, path, content):
+        """
+        Write content to a file in the workspace.
+
+        Args:
+            path: Path to file (relative to workspace root)
+            content: Content to write
+
+        Returns:
+            dict with 'success', 'error'
+        """
+        # Escape content for shell
+        content_escaped = content.replace("'", "'\\''")
+
+        # Create directory if needed, then write file
+        cmd = f"mkdir -p $(dirname {path}) && printf '%s' '{content_escaped}' > {path}"
+        result = self.container.exec(cmd, timeout=30)
+
+        return {
+            'success': result.returncode == 0,
+            'error': result.stderr if result.returncode != 0 else None
+        }
+
+    def find_replace_in_file(self, path, old_text, new_text):
+        """
+        Find and replace text in a file. Requires exactly one match.
+
+        Args:
+            path: Path to file (relative to workspace root)
+            old_text: Text to find (must match exactly once)
+            new_text: Text to replace with
+
+        Returns:
+            dict with 'success', 'error'
+        """
+        # First, read the file to check match count
+        read_result = self.read_file(path)
+        if not read_result['success']:
+            return {
+                'success': False,
+                'error': f"Could not read file: {read_result['error']}"
+            }
+
+        content = read_result['content']
+        match_count = content.count(old_text)
+
+        if match_count == 0:
+            return {
+                'success': False,
+                'error': f"No matches found for old_text in {path}"
+            }
+        elif match_count > 1:
+            return {
+                'success': False,
+                'error': f"Found {match_count} matches for old_text in {path}, expected exactly 1"
+            }
+
+        # Exactly one match - do the replacement
+        new_content = content.replace(old_text, new_text, 1)
+        write_result = self.write_file(path, new_content)
+
+        if write_result['success']:
+            return {
+                'success': True,
+                'error': None
+            }
+        else:
+            return {
+                'success': False,
+                'error': f"Failed to write file: {write_result['error']}"
+            }
+
+    def list_directory(self, path="."):
+        """
+        List files in a directory.
+
+        Args:
+            path: Directory path (default: current directory)
+
+        Returns:
+            dict with 'success', 'files', 'error'
+        """
+        result = self.container.exec(f"ls -1 {path}", timeout=30)
+
+        if result.returncode == 0:
+            files = [f for f in result.stdout.strip().split('\n') if f]
+            return {
+                'success': True,
+                'files': files,
+                'error': None
+            }
+        else:
+            return {
+                'success': False,
+                'files': [],
+                'error': result.stderr
+            }
+
+    # Code Search Tools
+
+    def ripgrep(self, pattern, path=".", glob=None, ignore_case=False):
+        """
+        Search code using ripgrep.
+
+        Args:
+            pattern: Search pattern (regex)
+            path: Path to search in (default: .)
+            glob: Optional glob pattern to filter files
+            ignore_case: Case-insensitive search
+
+        Returns:
+            dict with 'success', 'matches', 'stdout', 'stderr'
+        """
+        cmd = f"rg --json '{pattern}' {path}"
+
+        if glob:
+            cmd += f" --glob '{glob}'"
+
+        if ignore_case:
+            cmd += " -i"
+
+        result = self.container.exec(cmd, timeout=60)
+
+        # ripgrep returns 1 if no matches found, which is not an error
+        success = result.returncode in [0, 1]
+
+        return {
+            'success': success,
+            'matches': result.stdout,
+            'stdout': result.stdout,
+            'stderr': result.stderr
+        }
+
+    def find_files(self, pattern, path="."):
+        """
+        Find files by name pattern.
+
+        Args:
+            pattern: Filename pattern (glob)
+            path: Path to search in (default: .)
+
+        Returns:
+            dict with 'success', 'files', 'error'
+        """
+        cmd = f"find {path} -name '{pattern}'"
+        result = self.container.exec(cmd, timeout=60)
+
+        if result.returncode == 0:
+            files = [f for f in result.stdout.strip().split('\n') if f]
+            return {
+                'success': True,
+                'files': files,
+                'error': None
+            }
+        else:
+            return {
+                'success': False,
+                'files': [],
+                'error': result.stderr
+            }
+
+
+# ============================================================================
 # Session Management
 # ============================================================================
 

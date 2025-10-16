@@ -628,6 +628,178 @@ class TestContainerManager(unittest.TestCase):
             container.exec("echo hello")
 
 
+class TestToolExecutor(unittest.TestCase):
+    """Test tool execution in containers"""
+
+    def setUp(self):
+        """Set up container and workspace for testing"""
+        self.temp_dir = tempfile.mkdtemp()
+
+        # Try to detect container runtime
+        self.runtime = None
+        for cmd in ['container', 'docker']:
+            try:
+                subprocess.run([cmd, '--version'], check=True,
+                             capture_output=True)
+                self.runtime = cmd
+                break
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+
+        if not self.runtime:
+            self.skipTest("No container runtime (container or docker) available")
+
+        # Create workspace with test files
+        self.workspace = Path(self.temp_dir) / "workspace"
+        self.workspace.mkdir()
+
+        # Create some test files
+        (self.workspace / "hello.txt").write_text("Hello, World!")
+        (self.workspace / "test.py").write_text("print('test')\n")
+
+        # Start container with our image
+        self.container = shots_on_goal.ContainerManager(
+            image="shots-on-goal:latest",
+            runtime=self.runtime
+        )
+        self.container.start(str(self.workspace))
+
+        self.tool_executor = shots_on_goal.ToolExecutor(self.container)
+
+    def tearDown(self):
+        """Clean up"""
+        if hasattr(self, 'container'):
+            self.container.stop()
+        shutil.rmtree(self.temp_dir)
+
+    def test_read_file(self):
+        """Test reading a file"""
+        result = self.tool_executor.read_file("hello.txt")
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['content'], "Hello, World!")
+        self.assertIsNone(result['error'])
+
+    def test_read_nonexistent_file(self):
+        """Test reading a file that doesn't exist"""
+        result = self.tool_executor.read_file("nonexistent.txt")
+
+        self.assertFalse(result['success'])
+        self.assertIsNone(result['content'])
+        self.assertIsNotNone(result['error'])
+
+    def test_write_file(self):
+        """Test writing a file"""
+        result = self.tool_executor.write_file("newfile.txt", "New content")
+
+        self.assertTrue(result['success'])
+        self.assertIsNone(result['error'])
+
+        # Verify file was written
+        read_result = self.tool_executor.read_file("newfile.txt")
+        self.assertTrue(read_result['success'])
+        self.assertEqual(read_result['content'], "New content")
+
+    def test_write_file_with_directory(self):
+        """Test writing a file in a new directory"""
+        result = self.tool_executor.write_file("subdir/nested.txt", "Nested content")
+
+        self.assertTrue(result['success'])
+
+        # Verify file was written
+        read_result = self.tool_executor.read_file("subdir/nested.txt")
+        self.assertTrue(read_result['success'])
+        self.assertEqual(read_result['content'], "Nested content")
+
+    def test_find_replace_in_file(self):
+        """Test find and replace in a file"""
+        # Create a file with unique text
+        self.tool_executor.write_file("replace_test.txt", "Hello PLACEHOLDER world")
+
+        # Replace the placeholder
+        result = self.tool_executor.find_replace_in_file(
+            "replace_test.txt", "PLACEHOLDER", "beautiful"
+        )
+
+        self.assertTrue(result['success'])
+        self.assertIsNone(result['error'])
+
+        # Verify replacement
+        read_result = self.tool_executor.read_file("replace_test.txt")
+        self.assertEqual(read_result['content'], "Hello beautiful world")
+
+    def test_find_replace_no_match(self):
+        """Test find and replace with no matches"""
+        self.tool_executor.write_file("no_match.txt", "Hello world")
+
+        result = self.tool_executor.find_replace_in_file(
+            "no_match.txt", "NOTFOUND", "something"
+        )
+
+        self.assertFalse(result['success'])
+        self.assertIn("No matches found", result['error'])
+
+    def test_find_replace_multiple_matches(self):
+        """Test find and replace with multiple matches"""
+        self.tool_executor.write_file("multi.txt", "foo foo foo")
+
+        result = self.tool_executor.find_replace_in_file(
+            "multi.txt", "foo", "bar"
+        )
+
+        self.assertFalse(result['success'])
+        self.assertIn("Found 3 matches", result['error'])
+
+    def test_find_replace_nonexistent_file(self):
+        """Test find and replace on nonexistent file"""
+        result = self.tool_executor.find_replace_in_file(
+            "nonexistent.txt", "old", "new"
+        )
+
+        self.assertFalse(result['success'])
+        self.assertIn("Could not read file", result['error'])
+
+    def test_list_directory(self):
+        """Test listing directory contents"""
+        result = self.tool_executor.list_directory(".")
+
+        self.assertTrue(result['success'])
+        self.assertIn("hello.txt", result['files'])
+        self.assertIn("test.py", result['files'])
+        self.assertIsNone(result['error'])
+
+    def test_find_files(self):
+        """Test finding files by pattern"""
+        result = self.tool_executor.find_files("*.txt", ".")
+
+        self.assertTrue(result['success'])
+        self.assertGreater(len(result['files']), 0)
+        self.assertTrue(any("hello.txt" in f for f in result['files']))
+
+    def test_ripgrep(self):
+        """Test searching with ripgrep"""
+        result = self.tool_executor.ripgrep("Hello", ".")
+
+        self.assertTrue(result['success'])
+        self.assertIn("Hello", result['stdout'])
+
+    def test_ripgrep_no_matches(self):
+        """Test ripgrep with no matches"""
+        result = self.tool_executor.ripgrep("nonexistent_pattern_xyz", ".")
+
+        # Should still be success (ripgrep returns 1 for no matches, which we treat as success)
+        self.assertTrue(result['success'])
+
+    def test_bazel_query(self):
+        """Test bazel query (should fail without BUILD files, but command should work)"""
+        # This will fail because there's no Bazel workspace, but we're testing the tool works
+        result = self.tool_executor.bazel_query("//...")
+
+        # We expect this to fail (no BUILD files), but the tool should execute
+        self.assertFalse(result['success'])
+        self.assertIsNotNone(result['stderr'])
+
+
 def run_tests():
     """Run all tests"""
     loader = unittest.TestLoader()
@@ -642,6 +814,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestSessionManagement))
     suite.addTests(loader.loadTestsFromTestCase(TestGitManager))
     suite.addTests(loader.loadTestsFromTestCase(TestContainerManager))
+    suite.addTests(loader.loadTestsFromTestCase(TestToolExecutor))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
