@@ -1869,7 +1869,6 @@ def create_session(goal_description, repo_path, base_branch='main'):
     create_session_record(db, session_id, goal_description,
                          os.path.abspath(repo_path), base_branch)
 
-    print(f"Created session: {session_dir}")
     return session_dir, db
 
 
@@ -1880,12 +1879,12 @@ def load_session(session_path):
     """
     session_dir = Path(session_path)
     if not session_dir.exists():
-        print(f"Error: Session directory not found: {session_dir}")
+        logging.error(f"Session directory not found: {session_dir}")
         sys.exit(1)
 
     db_path = session_dir / "goals.db"
     if not db_path.exists():
-        print(f"Error: Database not found: {db_path}")
+        logging.error(f"Database not found: {db_path}")
         sys.exit(1)
 
     db = sqlite3.connect(str(db_path))
@@ -1896,7 +1895,7 @@ def load_session(session_path):
 
     session_record = get_session_record(db)
 
-    print(f"Loaded session: {session_dir}")
+    logging.info(f"Loaded session: {session_dir}")
     return session_dir, db, session_record
 
 
@@ -2011,8 +2010,8 @@ def main():
     # Handle resume command
     if args.resume:
         session_dir, db, session_record = load_session(args.resume)
-        print(f"Resuming: {session_record['description']}")
-        print(f"Repo: {session_record['repo_path']}")
+        logging.info(f"Resuming: {session_record['description']}")
+        logging.info(f"Repo: {session_record['repo_path']}")
         # TODO: Resume work on goals
         db.close()
         return
@@ -2025,11 +2024,11 @@ def main():
     # Validate repo path
     repo_path = Path(args.repo_path)
     if not repo_path.exists():
-        print(f"Error: Repository path does not exist: {repo_path}")
+        logging.error(f"Repository path does not exist: {repo_path}")
         sys.exit(1)
 
     if not (repo_path / ".git").exists():
-        print(f"Error: Not a git repository: {repo_path}")
+        logging.error(f"Not a git repository: {repo_path}")
         sys.exit(1)
 
     # Create new session
@@ -2041,9 +2040,9 @@ def main():
     logging.info(f"Created root goal (ID: {root_goal_id}): {args.goal}")
 
     # Start working on the root goal (with decomposition)
-    print("\n" + "=" * 80)
-    print("Starting work on goal (with recursive decomposition)...")
-    print("=" * 80 + "\n")
+    logging.info("=" * 80)
+    logging.info("Starting work on goal (with recursive decomposition)...")
+    logging.info("=" * 80)
 
     try:
         success = work_on_goal_recursive(
@@ -2056,21 +2055,22 @@ def main():
             max_attempts_per_goal=args.max_attempts
         )
 
-        print("\n" + "=" * 80)
-        print("Goal tree completed!")
-        print("=" * 80)
+        logging.info("=" * 80)
+        logging.info("Goal tree completed!")
+        logging.info("=" * 80)
 
         # Get final status
         final_goal = get_goal(db, root_goal_id)
-        print(f"\nRoot goal status: {final_goal['status']}")
+        logging.info(f"Root goal status: {final_goal['status']}")
 
         if success:
-            print("✓ Root goal completed successfully!")
+            logging.info("✓ Root goal completed successfully!")
         else:
-            print("✗ Root goal did not complete successfully")
+            logging.info("✗ Root goal did not complete successfully")
 
         # Show goal tree summary
-        print("\n--- Goal Tree Summary ---")
+        logging.info("")
+        logging.info("--- Goal Tree Summary ---")
         all_goals = db.execute("SELECT id, description, status, parent_id FROM goals ORDER BY id").fetchall()
         for goal in all_goals:
             depth = 0
@@ -2082,19 +2082,40 @@ def main():
 
             indent = "  " * depth
             status_icon = "✓" if goal['status'] == 'completed' else ("✗" if goal['status'] == 'failed' else "•")
-            print(f"{indent}{status_icon} Goal {goal['id']}: {goal['description'][:60]} [{goal['status']}]")
+            logging.info(f"{indent}{status_icon} Goal {goal['id']}: {goal['description'][:60]} [{goal['status']}]")
+
+        # Show worktree/branch information
+        logging.info("")
+        logging.info("--- Worktrees & Branches ---")
+        all_attempts = db.execute("""
+            SELECT a.id, a.goal_id, a.git_branch, a.worktree_path, a.outcome, a.final_commit_sha
+            FROM attempts a
+            ORDER BY a.id
+        """).fetchall()
+
+        for attempt in all_attempts:
+            if attempt['git_branch'] and attempt['worktree_path']:
+                status_icon = "✓" if attempt['outcome'] == 'success' else "✗"
+                commit_info = f" (commit: {attempt['final_commit_sha'][:8]})" if attempt['final_commit_sha'] else ""
+                logging.info(f"{status_icon} Attempt {attempt['id']} (Goal {attempt['goal_id']}): {attempt['outcome']}{commit_info}")
+                logging.info(f"    Branch: {attempt['git_branch']}")
+                logging.info(f"    Worktree: {attempt['worktree_path']}")
+                if attempt['final_commit_sha']:
+                    logging.info(f"    View: git show {attempt['final_commit_sha'][:8]}")
 
     except KeyboardInterrupt:
-        print("\n\nInterrupted by user. Session saved.")
+        logging.info("")
+        logging.info("Interrupted by user. Session saved.")
         update_session_status(db, 'interrupted')
     except Exception as e:
-        print(f"\n\nError during execution: {e}")
+        logging.error(f"Error during execution: {e}")
         update_session_status(db, 'failed')
         raise
     finally:
         db.close()
 
-    print(f"\nSession saved to: {session_dir}")
+    logging.info("")
+    logging.info(f"Session saved to: {session_dir}")
 
 
 if __name__ == "__main__":
