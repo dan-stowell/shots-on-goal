@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 from pathlib import Path
 from datetime import datetime
+from unittest.mock import patch
 
 # Import functions from main module
 import shots_on_goal
@@ -308,7 +309,6 @@ class TestSessionManagement(unittest.TestCase):
 
     def setUp(self):
         """Create temporary directory for test sessions"""
-        self.original_sessions_dir = shots_on_goal.get_sessions_dir()
         self.temp_dir = tempfile.mkdtemp()
 
         # Create a temporary git repo
@@ -320,60 +320,51 @@ class TestSessionManagement(unittest.TestCase):
         # Monkey-patch sessions directory
         self.sessions_dir = Path(self.temp_dir) / "sessions"
         self.sessions_dir.mkdir()
+        self.get_sessions_dir_patch = patch(
+            'shots_on_goal.get_sessions_dir',
+            return_value=self.sessions_dir
+        )
+        self.get_sessions_dir_patch.start()
 
     def tearDown(self):
         """Clean up temporary files"""
+        self.get_sessions_dir_patch.stop()
         shutil.rmtree(self.temp_dir)
 
     def test_create_session(self):
         """Test creating a new session"""
-        # Temporarily override sessions directory
-        import shots_on_goal
-        original_func = shots_on_goal.get_sessions_dir
-        shots_on_goal.get_sessions_dir = lambda: self.sessions_dir
+        session_dir, db = shots_on_goal.create_session(
+            "Test goal", str(self.repo_dir)
+        )
 
-        try:
-            session_dir, db = shots_on_goal.create_session(
-                "Test goal", str(self.repo_dir)
-            )
+        # Check session directory exists
+        self.assertTrue(session_dir.exists())
+        self.assertTrue((session_dir / "goals.db").exists())
 
-            # Check session directory exists
-            self.assertTrue(session_dir.exists())
-            self.assertTrue((session_dir / "goals.db").exists())
+        # Check session record
+        session = shots_on_goal.get_session_record(db)
+        self.assertEqual(session['description'], "Test goal")
+        self.assertEqual(session['status'], 'active')
 
-            # Check session record
-            session = shots_on_goal.get_session_record(db)
-            self.assertEqual(session['description'], "Test goal")
-            self.assertEqual(session['status'], 'active')
-
-            db.close()
-        finally:
-            shots_on_goal.get_sessions_dir = original_func
+        db.close()
 
     def test_load_session(self):
         """Test loading an existing session"""
-        import shots_on_goal
-        original_func = shots_on_goal.get_sessions_dir
-        shots_on_goal.get_sessions_dir = lambda: self.sessions_dir
+        # Create session
+        session_dir, db = shots_on_goal.create_session(
+            "Test goal", str(self.repo_dir)
+        )
+        db.close()
 
-        try:
-            # Create session
-            session_dir, db = shots_on_goal.create_session(
-                "Test goal", str(self.repo_dir)
-            )
-            db.close()
+        # Load it back
+        loaded_dir, loaded_db, session_record = shots_on_goal.load_session(
+            str(session_dir)
+        )
 
-            # Load it back
-            loaded_dir, loaded_db, session_record = shots_on_goal.load_session(
-                str(session_dir)
-            )
+        self.assertEqual(str(loaded_dir), str(session_dir))
+        self.assertEqual(session_record['description'], "Test goal")
 
-            self.assertEqual(str(loaded_dir), str(session_dir))
-            self.assertEqual(session_record['description'], "Test goal")
-
-            loaded_db.close()
-        finally:
-            shots_on_goal.get_sessions_dir = original_func
+        loaded_db.close()
 
 
 def run_tests():
