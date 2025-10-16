@@ -73,6 +73,9 @@ def init_database(db_path):
             outcome TEXT,
             failure_reason TEXT,
             git_branch TEXT,
+            worktree_path TEXT,
+            container_id TEXT,
+            git_commit_sha TEXT,
             FOREIGN KEY (goal_id) REFERENCES goals(id)
         )
     """)
@@ -189,11 +192,16 @@ def update_goal_status(db, goal_id, status, git_branch=None):
     db.commit()
 
 
-def create_attempt(db, goal_id, git_branch=None):
+def create_attempt(db, goal_id, git_branch=None, worktree_path=None,
+                   container_id=None, git_commit_sha=None):
     """Create a new attempt for a goal and return its ID."""
     cursor = db.execute(
-        "INSERT INTO attempts (goal_id, git_branch) VALUES (?, ?)",
-        (goal_id, git_branch)
+        """
+        INSERT INTO attempts
+        (goal_id, git_branch, worktree_path, container_id, git_commit_sha)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (goal_id, git_branch, worktree_path, container_id, git_commit_sha)
     )
     db.commit()
     return cursor.lastrowid

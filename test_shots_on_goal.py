@@ -257,6 +257,26 @@ class TestAttempts(unittest.TestCase):
         self.assertIn(attempt1_id, attempt_ids)
         self.assertIn(attempt2_id, attempt_ids)
 
+    def test_create_attempt_with_metadata(self):
+        """Test creating attempt with git sha, worktree, and container info"""
+        attempt_id = shots_on_goal.create_attempt(
+            self.db,
+            self.goal_id,
+            git_branch='goal-1-attempt-1',
+            worktree_path='/tmp/worktrees/goal-1-attempt-1',
+            container_id='abc123def456',
+            git_commit_sha='1234567890abcdef1234567890abcdef12345678'
+        )
+
+        attempts = shots_on_goal.get_attempts(self.db, self.goal_id)
+        self.assertEqual(len(attempts), 1)
+
+        attempt = attempts[0]
+        self.assertEqual(attempt['git_branch'], 'goal-1-attempt-1')
+        self.assertEqual(attempt['worktree_path'], '/tmp/worktrees/goal-1-attempt-1')
+        self.assertEqual(attempt['container_id'], 'abc123def456')
+        self.assertEqual(attempt['git_commit_sha'], '1234567890abcdef1234567890abcdef12345678')
+
 
 class TestActions(unittest.TestCase):
     """Test action recording"""
