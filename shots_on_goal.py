@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 import json
 import logging
+import random
+import time
 import llm
 from llm.utils import extract_fenced_code_block
 
@@ -79,6 +81,7 @@ def init_database(db_path):
         CREATE TABLE IF NOT EXISTS attempts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             goal_id INTEGER NOT NULL,
+            model_id TEXT,
             started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP,
             outcome TEXT,
@@ -92,11 +95,13 @@ def init_database(db_path):
         )
     """)
 
-    # Add final_commit_sha column if it doesn't exist (for existing databases)
+    # Add columns if they don't exist (for existing databases)
     cursor.execute("PRAGMA table_info(attempts)")
     columns = [row[1] for row in cursor.fetchall()]
     if 'final_commit_sha' not in columns:
         cursor.execute("ALTER TABLE attempts ADD COLUMN final_commit_sha TEXT")
+    if 'model_id' not in columns:
+        cursor.execute("ALTER TABLE attempts ADD COLUMN model_id TEXT")
 
     # Actions table (tool calls during attempts)
     cursor.execute("""
@@ -214,16 +219,16 @@ def update_goal_status(db, goal_id, status, git_branch=None):
     db.commit()
 
 
-def create_attempt(db, goal_id, git_branch=None, worktree_path=None,
+def create_attempt(db, goal_id, model_id=None, git_branch=None, worktree_path=None,
                    container_id=None, git_commit_sha=None):
     """Create a new attempt for a goal and return its ID."""
     cursor = db.execute(
         """
         INSERT INTO attempts
-        (goal_id, git_branch, worktree_path, container_id, git_commit_sha)
-        VALUES (?, ?, ?, ?, ?)
+        (goal_id, model_id, git_branch, worktree_path, container_id, git_commit_sha)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (goal_id, git_branch, worktree_path, container_id, git_commit_sha)
+        (goal_id, model_id, git_branch, worktree_path, container_id, git_commit_sha)
     )
     db.commit()
     return cursor.lastrowid
@@ -306,6 +311,42 @@ def get_actions(db, attempt_id):
 
 
 # ============================================================================
+# Model Utilities
+# ============================================================================
+
+def shorten_model_name(model_id):
+    """
+    Shorten model ID for use in branch names.
+
+    Examples:
+        'openrouter/anthropic/claude-haiku-4.5' -> 'haiku45'
+        'openrouter/x-ai/grok-code-fast-1' -> 'grok-code-fast-1'
+        'openrouter/google/gemini-2.5-flash' -> 'gemini25-flash'
+    """
+    # Remove 'openrouter/' prefix if present
+    name = model_id.replace('openrouter/', '')
+
+    # Common simplifications
+    name = name.replace('anthropic/', '')
+    name = name.replace('x-ai/', '')
+    name = name.replace('google/', '')
+    name = name.replace('openai/', '')
+    name = name.replace('z-ai/', '')
+    name = name.replace('qwen/', '')
+    name = name.replace('claude-', '')
+
+    # Remove dots and simplify version numbers
+    name = name.replace('.', '')
+    name = name.replace('_', '-')
+
+    # Truncate if too long (git branch names should be reasonable)
+    if len(name) > 20:
+        name = name[:20]
+
+    return name
+
+
+# ============================================================================
 # Git Management
 # ============================================================================
 
@@ -357,14 +398,18 @@ class GitManager:
 
         return branch_name
 
-    def create_worktree_for_attempt(self, goal_id, attempt_id, base_branch, session_id=None):
+    def create_worktree_for_attempt(self, goal_id, attempt_id, base_branch, session_id=None, model_id=None):
         """
         Create a worktree with a new branch for an attempt.
         Returns: (worktree_path, branch_name, commit_sha)
         """
-        # Include session_id for uniqueness across runs
+        # Include session_id and model for uniqueness across runs
         if session_id:
-            branch_name = f"s{session_id}-g{goal_id}-a{attempt_id}"
+            if model_id:
+                model_short = shorten_model_name(model_id)
+                branch_name = f"s{session_id}-g{goal_id}-a{attempt_id}-m{model_short}"
+            else:
+                branch_name = f"s{session_id}-g{goal_id}-a{attempt_id}"
         else:
             branch_name = f"goal-{goal_id}-attempt-{attempt_id}"
 
@@ -1183,7 +1228,7 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
     git_manager = GitManager(abs_repo_path)
 
     # Create attempt record first so we can derive branch/worktree names
-    attempt_id = create_attempt(db, goal_id=goal_id)
+    attempt_id = create_attempt(db, goal_id=goal_id, model_id=model_id)
 
     # Initialize variables for exception handling
     actions = []
@@ -1195,7 +1240,8 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
             goal_id,
             attempt_id=attempt_id,
             base_branch=base_branch,
-            session_id=session_id
+            session_id=session_id,
+            model_id=model_id
         )
 
         # Persist metadata we already know
@@ -1207,6 +1253,7 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
             git_commit_sha=commit_sha
         )
 
+        logging.info(f"[Attempt {attempt_id}] Model: {model_id}")
         logging.info(f"[Attempt {attempt_id}] Branch: {branch_name}")
         logging.info(f"[Attempt {attempt_id}] Worktree: {worktree_path}")
 
@@ -1225,7 +1272,7 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         goal = get_goal(db, goal_id)
         goal_description = goal['description']
 
-        logging.info(f"[Attempt {attempt_id}] Working on goal: {goal_description}")
+        logging.info(f"[Attempt {attempt_id}] [{model_id}] Working on goal: {goal_description}")
 
         # Set up after_call hook to record tool calls
         def after_call(tool, tool_call, tool_result):
@@ -1669,10 +1716,11 @@ Return ONLY valid JSON (you can wrap in ```json if you want):
 # Work Orchestration
 # ============================================================================
 
-def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, depth=0, max_depth=5,
-                          parent_working_branch=None, max_attempts_per_goal=3):
+def work_on_goal_with_tournament(db, goal_id, repo_path, image, runtime, model_pool,
+                                current_champion, goal_working_branch, depth=0):
     """
-    Work on a goal recursively: try multiple times, decompose if needed, work on sub-goals.
+    Run tournament-style parallel attempts with 2 models competing.
+    Winner (fastest to succeed) continues as champion.
 
     Args:
         db: Database connection
@@ -1680,14 +1728,121 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
         repo_path: Path to repository
         image: Container image
         runtime: Container runtime
-        model_id: LLM model ID
+        model_pool: List of model IDs to choose from
+        current_champion: Current champion model (or None for first goal)
+        goal_working_branch: Branch to base attempts on and merge into
+        depth: Current recursion depth (for logging)
+
+    Returns:
+        dict with 'success' (bool), 'winner_model' (str or None), 'result' (attempt result dict)
+    """
+    indent = "  " * depth
+
+    # Pick 2 models for the tournament
+    if current_champion and current_champion in model_pool:
+        # Champion vs random challenger
+        available = [m for m in model_pool if m != current_champion]
+        if available:
+            challenger = random.choice(available)
+            model_a, model_b = current_champion, challenger
+            logging.info(f"{indent}[Goal {goal_id}] Tournament: Champion {shorten_model_name(model_a)} vs {shorten_model_name(model_b)}")
+        else:
+            # Only one model in pool
+            model_a, model_b = current_champion, current_champion
+            logging.info(f"{indent}[Goal {goal_id}] Single model: {shorten_model_name(model_a)}")
+    else:
+        # No champion or champion not in pool - pick 2 random
+        if len(model_pool) >= 2:
+            model_a, model_b = random.sample(model_pool, 2)
+            logging.info(f"{indent}[Goal {goal_id}] Tournament: {shorten_model_name(model_a)} vs {shorten_model_name(model_b)}")
+        elif len(model_pool) == 1:
+            model_a = model_b = model_pool[0]
+            logging.info(f"{indent}[Goal {goal_id}] Single model: {shorten_model_name(model_a)}")
+        else:
+            logging.error(f"{indent}[Goal {goal_id}] No models in pool!")
+            return {'success': False, 'winner_model': None, 'result': None}
+
+    # Run first model (champion or randomly chosen)
+    winner_model = None
+    winner_result = None
+
+    logging.info(f"{indent}[Goal {goal_id}]   Running {shorten_model_name(model_a)}...")
+    start_time = time.time()
+    result_a = work_on_goal(
+        db=db,
+        goal_id=goal_id,
+        repo_path=repo_path,
+        image=image,
+        runtime=runtime,
+        model_id=model_a,
+        goal_working_branch=goal_working_branch,
+        merge_target_branch=goal_working_branch
+    )
+    elapsed_a = time.time() - start_time
+
+    if result_a['outcome'] == 'success':
+        # First model succeeded - it wins!
+        winner_model = model_a
+        winner_result = result_a
+        logging.info(f"{indent}[Goal {goal_id}] ✓ {shorten_model_name(model_a)} succeeded in {elapsed_a:.1f}s")
+        logging.info(f"{indent}[Goal {goal_id}] 🏆 {shorten_model_name(model_a)} WINS!")
+    else:
+        # First model failed
+        logging.info(f"{indent}[Goal {goal_id}] ✗ {shorten_model_name(model_a)} failed: {result_a['outcome']} (took {elapsed_a:.1f}s)")
+
+        # Only run second model if it's different from first
+        if model_a != model_b:
+            logging.info(f"{indent}[Goal {goal_id}]   Running {shorten_model_name(model_b)}...")
+            start_time = time.time()
+            result_b = work_on_goal(
+                db=db,
+                goal_id=goal_id,
+                repo_path=repo_path,
+                image=image,
+                runtime=runtime,
+                model_id=model_b,
+                goal_working_branch=goal_working_branch,
+                merge_target_branch=goal_working_branch
+            )
+            elapsed_b = time.time() - start_time
+
+            if result_b['outcome'] == 'success':
+                # Second model succeeded!
+                winner_model = model_b
+                winner_result = result_b
+                logging.info(f"{indent}[Goal {goal_id}] ✓ {shorten_model_name(model_b)} succeeded in {elapsed_b:.1f}s")
+                logging.info(f"{indent}[Goal {goal_id}] 🏆 {shorten_model_name(model_b)} WINS!")
+            else:
+                # Second model also failed
+                logging.info(f"{indent}[Goal {goal_id}] ✗ {shorten_model_name(model_b)} failed: {result_b['outcome']} (took {elapsed_b:.1f}s)")
+                logging.info(f"{indent}[Goal {goal_id}] Both models failed")
+
+    return {
+        'success': winner_model is not None,
+        'winner_model': winner_model,
+        'result': winner_result
+    }
+
+
+def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_pool, depth=0, max_depth=5,
+                          parent_working_branch=None, current_champion=None):
+    """
+    Work on a goal recursively with tournament-style model competition.
+
+    Args:
+        db: Database connection
+        goal_id: Goal ID to work on
+        repo_path: Path to repository
+        image: Container image
+        runtime: Container runtime
+        model_pool: List of model IDs to choose from
         depth: Current recursion depth
         max_depth: Maximum recursion depth
         parent_working_branch: Parent goal's working branch (None for root goal)
-        max_attempts_per_goal: Maximum attempts per goal before decomposing (default: 3)
+        current_champion: Current champion model (winner from previous goal)
 
     Returns:
-        bool: True if goal completed successfully
+        tuple: (success: bool, champion: str or None)
     """
     indent = "  " * depth
     goal = get_goal(db, goal_id)
@@ -1699,7 +1854,7 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
     if depth >= max_depth:
         logging.warning(f"{indent}[Goal {goal_id}] Max depth ({max_depth}) reached - marking as failed")
         update_goal_status(db, goal_id, 'failed')
-        return False
+        return False, None
 
     # Create or get goal's working branch
     git_manager = GitManager(os.path.abspath(repo_path))
@@ -1743,85 +1898,72 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
     if goal['status'] != 'in_progress':
         update_goal_status(db, goal_id, 'in_progress')
 
-    # Try multiple attempts with feedback loop
-    attempt_results = []
-    current_base_branch = goal_working_branch  # Start from goal's working branch
+    # Run tournament: 2 models compete in parallel
+    tournament_result = work_on_goal_with_tournament(
+        db=db,
+        goal_id=goal_id,
+        repo_path=repo_path,
+        image=image,
+        runtime=runtime,
+        model_pool=model_pool,
+        current_champion=current_champion,
+        goal_working_branch=goal_working_branch,
+        depth=depth
+    )
 
-    for attempt_num in range(1, max_attempts_per_goal + 1):
-        logging.info(f"{indent}[Goal {goal_id}] Attempt {attempt_num}/{max_attempts_per_goal}")
+    # Handle the outcome
+    if tournament_result['success']:
+        winner = tournament_result['winner_model']
+        logging.info(f"{indent}[Goal {goal_id}] ✓ Completed successfully - {shorten_model_name(winner)} wins!")
+        update_goal_status(db, goal_id, 'completed')
+        return True, winner  # Return success and the winning model
+    else:
+        logging.info(f"{indent}[Goal {goal_id}] Tournament failed - both models unsuccessful")
 
-        # Pass previous attempt info for feedback (if any)
-        previous_attempts = attempt_results if attempt_results else None
-
-        # For attempt 1, use goal_working_branch
-        # For attempts 2+, use the previous attempt's branch to build on partial progress
-        if attempt_num > 1 and attempt_results:
-            prev_attempt_branch = attempt_results[-1].get('attempt_branch')
-            if prev_attempt_branch:
-                current_base_branch = prev_attempt_branch
-                logging.info(f"{indent}[Goal {goal_id}]   Branching from previous attempt: {prev_attempt_branch}")
-
-        result = work_on_goal(
-            db=db,
-            goal_id=goal_id,
-            repo_path=repo_path,
-            image=image,
-            runtime=runtime,
-            model_id=model_id,
-            goal_working_branch=current_base_branch,
-            previous_attempts=previous_attempts,
-            merge_target_branch=goal_working_branch  # Always merge into the original goal branch
-        )
-
-        attempt_results.append(result)
-
-        # Handle the outcome
-        if result['outcome'] == 'success':
-            logging.info(f"{indent}[Goal {goal_id}] ✓ Completed successfully on attempt {attempt_num}")
-            update_goal_status(db, goal_id, 'completed')
-            return True
-        else:
-            logging.info(f"{indent}[Goal {goal_id}] Attempt {attempt_num} failed: {result['outcome']}")
-
-    # All attempts failed - check if we should decompose
+    # Tournament failed - check if we should decompose
     # Only decompose root goals (goals without parents)
     # Sub-goals that fail should not be decomposed further
     if goal['parent_id'] is None:
             # Root goal - decompose and work on sub-goals
-            logging.info(f"{indent}[Goal {goal_id}] All {max_attempts_per_goal} attempts failed - decomposing...")
+            logging.info(f"{indent}[Goal {goal_id}] Tournament failed - decomposing...")
 
-            sub_goal_ids = decompose_goal(db, goal_id, attempt_results, model_id=model_id)
+            # Use one of the models from pool for decomposition
+            decomp_model = model_pool[0] if model_pool else 'openrouter/anthropic/claude-haiku-4.5'
+            sub_goal_ids = decompose_goal(db, goal_id, [], model_id=decomp_model)
 
             if not sub_goal_ids:
                 logging.warning(f"{indent}[Goal {goal_id}] No sub-goals created - marking as failed")
                 update_goal_status(db, goal_id, 'failed')
-                return False
+                return False, None
     else:
         # Sub-goal failed - don't decompose further, just fail
-        logging.warning(f"{indent}[Goal {goal_id}] Sub-goal failed after {max_attempts_per_goal} attempts")
+        logging.warning(f"{indent}[Goal {goal_id}] Sub-goal tournament failed")
         logging.warning(f"{indent}[Goal {goal_id}] Not decomposing (sub-goals don't decompose) - marking as failed")
         update_goal_status(db, goal_id, 'failed')
-        return False
+        return False, None
 
     # Work on each sub-goal sequentially
     # Each sub-goal branches from parent's working branch,
     # and successful attempts are merged back into it
     # STOP on first failure (fail-fast)
+    # Champion from parent goal gets to compete in first sub-goal
     all_succeeded = True
+    subgoal_champion = current_champion  # Start with parent's champion
+
     for i, sub_goal_id in enumerate(sub_goal_ids, 1):
         logging.info(f"{indent}[Goal {goal_id}] Working on sub-goal {i}/{len(sub_goal_ids)}")
 
-        success = work_on_goal_recursive(
+        success, subgoal_champion = work_on_goal_recursive(
             db=db,
             goal_id=sub_goal_id,
             repo_path=repo_path,
             image=image,
             runtime=runtime,
-            model_id=model_id,
+            model_pool=model_pool,
             depth=depth + 1,
             max_depth=max_depth,
             parent_working_branch=goal_working_branch,  # Sub-goals build on parent's branch
-            max_attempts_per_goal=max_attempts_per_goal  # Pass through the max attempts
+            current_champion=subgoal_champion  # Pass champion from previous sub-goal
         )
 
         if not success:
@@ -1830,16 +1972,18 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
             break  # Fail fast - don't process remaining sub-goals
         else:
             logging.info(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} succeeded - changes merged into {goal_working_branch}")
+            if subgoal_champion:
+                logging.info(f"{indent}[Goal {goal_id}]   Champion: {shorten_model_name(subgoal_champion)}")
 
     # Update parent goal status based on sub-goals
     if all_succeeded:
         logging.info(f"{indent}[Goal {goal_id}] ✓ All sub-goals completed - marking as completed")
         update_goal_status(db, goal_id, 'completed')
-        return True
+        return True, subgoal_champion  # Return the final champion
     else:
         logging.warning(f"{indent}[Goal {goal_id}] ✗ Some sub-goals failed - marking as failed")
         update_goal_status(db, goal_id, 'failed')
-        return False
+        return False, None
 
 
 # ============================================================================
@@ -1974,20 +2118,26 @@ def main():
 
     # Configuration options
     parser.add_argument(
-        '--model',
-        default='openrouter/anthropic/claude-haiku-4.5',
-        help='LLM model to use (default: openrouter/anthropic/claude-haiku-4.5)'
+        '--model-pool',
+        nargs='+',
+        default=[
+            'openrouter/x-ai/grok-code-fast-1',
+            'openrouter/anthropic/claude-sonnet-4.5',
+            'openrouter/anthropic/claude-haiku-4.5',
+            'openrouter/google/gemini-2.5-flash',
+            'openrouter/x-ai/grok-4-fast',
+            'openrouter/google/gemini-2.5-pro',
+            'openrouter/z-ai/glm-4.6',
+            'openrouter/qwen/qwen3-coder-30b-a3b-instruct',
+            'openrouter/openai/gpt-5',
+            'openrouter/openai/gpt-5-codex',
+        ],
+        help='LLM models to use in tournament (default: 10 diverse models including Grok, Claude, Gemini, GPT-5, etc.)'
     )
     parser.add_argument(
         '--image',
         default='shots-on-goal:latest',
         help='Container image to use (default: shots-on-goal:latest)'
-    )
-    parser.add_argument(
-        '--max-attempts',
-        type=int,
-        default=3,
-        help='Maximum attempts per goal before decomposing (default: 3)'
     )
     parser.add_argument(
         '--verbose',
@@ -2045,14 +2195,13 @@ def main():
     logging.info("=" * 80)
 
     try:
-        success = work_on_goal_recursive(
+        success, final_champion = work_on_goal_recursive(
             db=db,
             goal_id=root_goal_id,
             repo_path=str(repo_path),
             image=args.image,
             runtime=detect_container_runtime(),
-            model_id=args.model,
-            max_attempts_per_goal=args.max_attempts
+            model_pool=args.model_pool
         )
 
         logging.info("=" * 80)
@@ -2065,6 +2214,8 @@ def main():
 
         if success:
             logging.info("✓ Root goal completed successfully!")
+            if final_champion:
+                logging.info(f"  Final champion: {final_champion}")
         else:
             logging.info("✗ Root goal did not complete successfully")
 
@@ -2088,7 +2239,7 @@ def main():
         logging.info("")
         logging.info("--- Worktrees & Branches ---")
         all_attempts = db.execute("""
-            SELECT a.id, a.goal_id, a.git_branch, a.worktree_path, a.outcome, a.final_commit_sha
+            SELECT a.id, a.goal_id, a.model_id, a.git_branch, a.worktree_path, a.outcome, a.final_commit_sha
             FROM attempts a
             ORDER BY a.id
         """).fetchall()
@@ -2096,8 +2247,9 @@ def main():
         for attempt in all_attempts:
             if attempt['git_branch'] and attempt['worktree_path']:
                 status_icon = "✓" if attempt['outcome'] == 'success' else "✗"
+                model_short = shorten_model_name(attempt['model_id']) if attempt['model_id'] else 'unknown'
                 commit_info = f" (commit: {attempt['final_commit_sha'][:8]})" if attempt['final_commit_sha'] else ""
-                logging.info(f"{status_icon} Attempt {attempt['id']} (Goal {attempt['goal_id']}): {attempt['outcome']}{commit_info}")
+                logging.info(f"{status_icon} Attempt {attempt['id']} (Goal {attempt['goal_id']}, Model: {model_short}): {attempt['outcome']}{commit_info}")
                 logging.info(f"    Branch: {attempt['git_branch']}")
                 logging.info(f"    Worktree: {attempt['worktree_path']}")
                 if attempt['final_commit_sha']:
