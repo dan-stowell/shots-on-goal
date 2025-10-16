@@ -1206,6 +1206,9 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
             git_commit_sha=commit_sha
         )
 
+        logging.info(f"[Attempt {attempt_id}] Branch: {branch_name}")
+        logging.info(f"[Attempt {attempt_id}] Worktree: {worktree_path}")
+
         container_id = container.start(worktree_path)
 
         # Record container ID once the container is running
@@ -1412,7 +1415,9 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             f"Attempt {attempt_id}: {outcome}\n\nGoal: {goal_description}"
         )
         if final_commit_sha:
-            logging.info(f"[Attempt {attempt_id}] Committed changes: {final_commit_sha[:8]}")
+            logging.info(f"[Attempt {attempt_id}] Committed changes: {final_commit_sha[:8]} on branch {branch_name}")
+            logging.info(f"[Attempt {attempt_id}]   View changes: git show {final_commit_sha[:8]}")
+            logging.info(f"[Attempt {attempt_id}]   Worktree files: {worktree_path}")
             update_attempt_metadata(db, attempt_id, final_commit_sha=final_commit_sha)
         else:
             logging.info(f"[Attempt {attempt_id}] No changes to commit")
