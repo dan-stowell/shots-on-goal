@@ -243,6 +243,35 @@ def record_action(db, attempt_id, tool_name, parameters, result):
     return cursor.lastrowid
 
 
+def update_attempt_metadata(db, attempt_id, git_branch=None,
+                            worktree_path=None, container_id=None,
+                            git_commit_sha=None):
+    """Update mutable metadata for an attempt."""
+    fields = []
+    values = []
+
+    if git_branch is not None:
+        fields.append("git_branch = ?")
+        values.append(git_branch)
+    if worktree_path is not None:
+        fields.append("worktree_path = ?")
+        values.append(worktree_path)
+    if container_id is not None:
+        fields.append("container_id = ?")
+        values.append(container_id)
+    if git_commit_sha is not None:
+        fields.append("git_commit_sha = ?")
+        values.append(git_commit_sha)
+
+    if not fields:
+        return
+
+    values.append(attempt_id)
+    query = f"UPDATE attempts SET {', '.join(fields)} WHERE id = ?"
+    db.execute(query, tuple(values))
+    db.commit()
+
+
 def get_actions(db, attempt_id):
     """Get all actions for an attempt."""
     cursor = db.execute(
@@ -802,6 +831,155 @@ class ToolExecutor:
                 'files': [],
                 'error': result.stderr
             }
+
+
+# ============================================================================
+# Work Loop
+# ============================================================================
+
+def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="container"):
+    """
+    Execute a hardcoded sequence of tool calls for a goal (skeleton implementation).
+
+    This is a testing function to validate the plumbing before adding LLM integration.
+
+    Args:
+        db: Database connection
+        goal_id: Goal ID to work on
+        repo_path: Path to the repository
+        image: Container image to use
+        runtime: Container runtime ('container' or 'docker')
+
+    Returns:
+        dict with 'success', 'attempt_id', 'actions', 'outcome'
+    """
+    # Get session info for base branch
+    session_record = get_session_record(db)
+    base_branch = session_record['base_branch']
+
+    # Initialize managers
+    git_manager = GitManager(repo_path)
+
+    # Create attempt record first so we can derive branch/worktree names
+    attempt_id = create_attempt(db, goal_id=goal_id)
+
+    # Create worktree for the attempt using the real attempt ID
+    worktree_path, branch_name, commit_sha = git_manager.create_worktree_for_attempt(
+        goal_id,
+        attempt_id=attempt_id,
+        base_branch=base_branch
+    )
+
+    # Persist metadata we already know
+    update_attempt_metadata(
+        db,
+        attempt_id,
+        git_branch=branch_name,
+        worktree_path=worktree_path,
+        git_commit_sha=commit_sha
+    )
+
+    # Start container
+    container = ContainerManager(image=image, runtime=runtime)
+
+    # Initialize variables for exception handling
+    actions = []
+
+    try:
+        container_id = container.start(worktree_path)
+
+        # Record container ID once the container is running
+        update_attempt_metadata(db, attempt_id, container_id=container_id)
+
+        # Initialize tool executor
+        tools = ToolExecutor(container)
+
+        # ============================================================
+        # Hardcoded sequence of tool calls for testing
+        # ============================================================
+
+        # 1. List files in the workspace
+        print(f"[Attempt {attempt_id}] Listing workspace files...")
+        result = tools.list_directory(".")
+        record_action(db, attempt_id, "list_directory", {"path": "."}, json.dumps(result))
+        actions.append({"tool": "list_directory", "result": result})
+        print(f"  Found {len(result.get('files', []))} files")
+
+        # 2. Try to find BUILD files
+        print(f"[Attempt {attempt_id}] Searching for BUILD files...")
+        result = tools.find_files("BUILD*", ".")
+        record_action(db, attempt_id, "find_files", {"pattern": "BUILD*", "path": "."}, json.dumps(result))
+        actions.append({"tool": "find_files", "result": result})
+        build_files = result.get('files', [])
+        print(f"  Found {len(build_files)} BUILD files")
+
+        # 3. If there's a README, read it
+        print(f"[Attempt {attempt_id}] Looking for README...")
+        readme_result = tools.find_files("README*", ".")
+        readme_files = readme_result.get('files', [])
+
+        if readme_files:
+            readme_path = readme_files[0]
+            print(f"[Attempt {attempt_id}] Reading {readme_path}...")
+            result = tools.read_file(readme_path)
+            record_action(db, attempt_id, "read_file", {"path": readme_path}, json.dumps(result))
+            actions.append({"tool": "read_file", "result": result})
+
+            if result['success']:
+                content_length = len(result.get('content', ''))
+                print(f"  Read {content_length} characters")
+
+        # 4. Try a bazel query if there are BUILD files
+        if build_files:
+            print(f"[Attempt {attempt_id}] Running bazel query...")
+            result = tools.bazel_query("//...")
+            record_action(db, attempt_id, "bazel_query", {"query": "//..."}, json.dumps(result))
+            actions.append({"tool": "bazel_query", "result": result})
+
+            if result['success']:
+                print(f"  Query succeeded")
+            else:
+                print(f"  Query failed: {result.get('stderr', 'Unknown error')[:100]}")
+
+        # ============================================================
+        # Determine outcome
+        # ============================================================
+
+        # For this skeleton, we just mark it as successful if we got through all steps
+        outcome = "success"
+        failure_reason = None
+
+        print(f"[Attempt {attempt_id}] Completed with outcome: {outcome}")
+
+        # Update attempt with outcome
+        update_attempt_outcome(db, attempt_id, outcome, failure_reason)
+
+        return {
+            'success': True,
+            'attempt_id': attempt_id,
+            'actions': actions,
+            'outcome': outcome
+        }
+
+    except Exception as e:
+        # If something went wrong, record failure
+        print(f"[Attempt {attempt_id or '???'}] Failed with exception: {e}")
+
+        if attempt_id is not None:
+            update_attempt_outcome(db, attempt_id, "failure", str(e))
+
+        return {
+            'success': False,
+            'attempt_id': attempt_id,
+            'actions': actions,
+            'outcome': "failure",
+            'error': str(e)
+        }
+
+    finally:
+        # Always clean up container
+        container.stop()
+        print(f"[Attempt {attempt_id or '???'}] Cleaned up container")
 
 
 # ============================================================================

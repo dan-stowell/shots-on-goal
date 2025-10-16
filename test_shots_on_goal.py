@@ -257,6 +257,25 @@ class TestAttempts(unittest.TestCase):
         self.assertIn(attempt1_id, attempt_ids)
         self.assertIn(attempt2_id, attempt_ids)
 
+    def test_update_attempt_metadata(self):
+        """Test updating attempt metadata fields"""
+        attempt_id = shots_on_goal.create_attempt(self.db, self.goal_id)
+
+        shots_on_goal.update_attempt_metadata(
+            self.db,
+            attempt_id,
+            git_branch='goal-branch',
+            worktree_path='/tmp/worktree',
+            container_id='container-123',
+            git_commit_sha='abc123'
+        )
+
+        attempt = shots_on_goal.get_attempts(self.db, self.goal_id)[0]
+        self.assertEqual(attempt['git_branch'], 'goal-branch')
+        self.assertEqual(attempt['worktree_path'], '/tmp/worktree')
+        self.assertEqual(attempt['container_id'], 'container-123')
+        self.assertEqual(attempt['git_commit_sha'], 'abc123')
+
     def test_create_attempt_with_metadata(self):
         """Test creating attempt with git sha, worktree, and container info"""
         attempt_id = shots_on_goal.create_attempt(
@@ -800,6 +819,113 @@ class TestToolExecutor(unittest.TestCase):
         self.assertIsNotNone(result['stderr'])
 
 
+class TestWorkOnGoal(unittest.TestCase):
+    """Test the work_on_goal function (end-to-end)"""
+
+    def setUp(self):
+        """Set up test environment"""
+        self.temp_dir = tempfile.mkdtemp()
+
+        # Try to detect container runtime
+        self.runtime = None
+        for cmd in ['container', 'docker']:
+            try:
+                subprocess.run([cmd, '--version'], check=True,
+                             capture_output=True)
+                self.runtime = cmd
+                break
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+
+        if not self.runtime:
+            self.skipTest("No container runtime (container or docker) available")
+
+        # Create a test git repo with some files
+        self.repo_dir = Path(self.temp_dir) / "test-repo"
+        self.repo_dir.mkdir()
+
+        # Initialize git repo
+        subprocess.run(['git', 'init'], cwd=self.repo_dir, check=True,
+                      capture_output=True)
+        subprocess.run(['git', 'config', 'user.email', 'test@example.com'],
+                      cwd=self.repo_dir, check=True, capture_output=True)
+        subprocess.run(['git', 'config', 'user.name', 'Test User'],
+                      cwd=self.repo_dir, check=True, capture_output=True)
+
+        # Create test files
+        (self.repo_dir / "README.md").write_text("# Test Project\n\nThis is a test.\n")
+        (self.repo_dir / "src").mkdir()
+        (self.repo_dir / "src" / "main.py").write_text("def main():\n    print('hello')\n")
+
+        # Initial commit
+        subprocess.run(['git', 'add', '.'], cwd=self.repo_dir, check=True,
+                      capture_output=True)
+        subprocess.run(['git', 'commit', '-m', 'Initial commit'],
+                      cwd=self.repo_dir, check=True, capture_output=True)
+
+        # Create session and database
+        self.db_path = Path(self.temp_dir) / "test.db"
+        self.db = shots_on_goal.init_database(str(self.db_path))
+        shots_on_goal.create_session_record(
+            self.db, 'test-session', 'Test session', str(self.repo_dir), 'main'
+        )
+
+    def tearDown(self):
+        """Clean up"""
+        self.db.close()
+        shutil.rmtree(self.temp_dir)
+
+    def test_work_on_goal_basic_flow(self):
+        """Test the basic work_on_goal flow with hardcoded tools"""
+        # Create a goal
+        goal_id = shots_on_goal.create_goal(self.db, "Test goal: explore the repository")
+
+        # Run work_on_goal
+        result = shots_on_goal.work_on_goal(
+            db=self.db,
+            goal_id=goal_id,
+            repo_path=str(self.repo_dir),
+            image="shots-on-goal:latest",
+            runtime=self.runtime
+        )
+
+        # Verify the result
+        self.assertTrue(result['success'], f"work_on_goal failed: {result.get('error', 'Unknown error')}")
+        self.assertEqual(result['outcome'], 'success')
+        self.assertIsNotNone(result['attempt_id'])
+        self.assertGreater(len(result['actions']), 0)
+
+        # Verify attempt was recorded
+        attempt_id = result['attempt_id']
+        attempts = shots_on_goal.get_attempts(self.db, goal_id)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]['id'], attempt_id)
+        self.assertEqual(attempts[0]['outcome'], 'success')
+        self.assertIsNotNone(attempts[0]['worktree_path'])
+        self.assertIsNotNone(attempts[0]['git_branch'])
+        self.assertIsNotNone(attempts[0]['git_commit_sha'])
+
+        # Verify actions were recorded
+        actions = shots_on_goal.get_actions(self.db, attempt_id)
+        self.assertGreater(len(actions), 0, "Expected at least one action to be recorded")
+
+        # Check that we have expected tool calls
+        tool_names = [action['tool_name'] for action in actions]
+        self.assertIn('list_directory', tool_names)
+        self.assertIn('find_files', tool_names)
+
+        # The worktree should exist (temporarily during the test)
+        # Note: The container cleanup happens in the finally block, but worktree persists
+        worktree_path = attempts[0]['worktree_path']
+        # The worktree will exist since we don't explicitly clean it up in work_on_goal
+        self.assertTrue(Path(worktree_path).exists())
+
+        print(f"\nTest completed successfully!")
+        print(f"  Attempt ID: {attempt_id}")
+        print(f"  Actions recorded: {len(actions)}")
+        print(f"  Tools used: {tool_names}")
+
+
 def run_tests():
     """Run all tests"""
     loader = unittest.TestLoader()
@@ -815,6 +941,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestGitManager))
     suite.addTests(loader.loadTestsFromTestCase(TestContainerManager))
     suite.addTests(loader.loadTestsFromTestCase(TestToolExecutor))
+    suite.addTests(loader.loadTestsFromTestCase(TestWorkOnGoal))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
