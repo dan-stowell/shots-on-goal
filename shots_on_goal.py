@@ -1393,14 +1393,15 @@ def create_v2_tool_functions(tools_executor):
 # ============================================================================
 
 def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
-                           attempt_type='implementation', max_tools=50):
+                           attempt_type='implementation', max_tools=50,
+                           image='shots-on-goal:latest', runtime='container'):
     """
     V2 orchestration with real LLM integration.
 
     This function:
     - Creates branch and worktree
     - Tracks attempt in V2 schema
-    - Calls real LLM with tools
+    - Calls real LLM with tools (in container)
     - Records tool calls
     - Runs validation
     - Creates attempt result
@@ -1413,6 +1414,8 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
         model_id: Model to use
         attempt_type: 'implementation' or 'breakdown'
         max_tools: Max tool calls allowed
+        image: Container image to use
+        runtime: Container runtime ('container' or 'docker')
 
     Returns:
         {
@@ -1517,65 +1520,71 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
         tool_id_map[tool['name']] = tool['id']
     logging.debug(f"[V2] Linked {len(tools_list)} tools to attempt")
 
-    # Initialize tool executor and create tool functions
-    tools_executor = WorktreeToolExecutor(worktree_path)
-    tool_functions = create_v2_tool_functions(tools_executor)
-
-    # Track tool calls and activity
-    tool_calls_made = []
-    last_activity_time = [time.time()]
-
-    def after_call(tool, tool_call, tool_result):
-        """Record each tool call"""
-        # Check timeout (2 minutes)
-        elapsed = time.time() - last_activity_time[0]
-        if elapsed > 120:
-            logging.error(f"[V2 Attempt {attempt_id}] Timeout: No activity for {elapsed:.1f}s")
-            raise LLMTimeoutError(f"No activity for {elapsed:.1f}s (timeout: 120s)")
-
-        last_activity_time[0] = time.time()
-
-        # Get tool name
-        tool_name = getattr(tool, "name", getattr(tool, "__name__", "unknown"))
-
-        # Log
-        args_str = str(tool_call.arguments)[:100]
-        logging.info(f"[V2]   Tool {len(tool_calls_made)+1}/{max_tools}: {tool_name}({args_str})")
-
-        # Record tool call
-        tool_id = tool_id_map.get(tool_name)
-        if tool_id:
-            create_tool_call_v2(
-                db, attempt_id, len(tool_calls_made) + 1, tool_id, tool_name,
-                input_data=json.dumps(tool_call.arguments),
-                output=str(tool_result.output)
-            )
-
-        tool_calls_made.append({'name': tool_name, 'args': tool_call.arguments})
-
-        # Check tool limit
-        if len(tool_calls_made) >= max_tools:
-            logging.warning(f"[V2 Attempt {attempt_id}] Tool limit ({max_tools}) reached")
-            raise ToolLimitExceeded(f"Tool limit of {max_tools} exceeded")
+    # Create container for isolated execution
+    container = ContainerManager(image=image, runtime=runtime)
+    container_id = container.start(worktree_path)
+    logging.info(f"[V2] Started container {container_id[:12]}")
 
     try:
-        # Call LLM with tools
-        logging.info(f"[V2] Calling LLM {model_id}...")
-        model = llm.get_model(model_id)
+        # Initialize tool executor and create tool functions
+        tools_executor = ToolExecutor(container)
+        tool_functions = create_v2_tool_functions(tools_executor)
 
-        # Get validation steps to include in prompt
-        validation_steps = get_validation_steps_v2(db, goal_id)
-        validation_text = ""
-        if validation_steps:
-            validation_text = "\n\n**Success criteria (validation commands):**\n"
-            validation_text += "Your changes will be validated by running these commands:\n"
-            for step in validation_steps:
-                validation_text += f"- `{step['command']}`\n"
-            validation_text += "\n**IMPORTANT:** Run these validation commands yourself using the appropriate tools (e.g., bazel_build, bazel_test).\n"
-            validation_text += "Once ALL validation commands pass, STOP making changes and explain that you've completed the goal.\n"
-            validation_text += "Do NOT continue making unnecessary changes or writing documentation after validation passes."
+        # Track tool calls and activity
+        tool_calls_made = []
+        last_activity_time = [time.time()]
 
-        system_prompt = f"""You are an autonomous coding agent working on a specific goal in a git repository.
+        def after_call(tool, tool_call, tool_result):
+            """Record each tool call"""
+            # Check timeout (2 minutes)
+            elapsed = time.time() - last_activity_time[0]
+            if elapsed > 120:
+                logging.error(f"[V2 Attempt {attempt_id}] Timeout: No activity for {elapsed:.1f}s")
+                raise LLMTimeoutError(f"No activity for {elapsed:.1f}s (timeout: 120s)")
+
+            last_activity_time[0] = time.time()
+
+            # Get tool name
+            tool_name = getattr(tool, "name", getattr(tool, "__name__", "unknown"))
+
+            # Log
+            args_str = str(tool_call.arguments)[:100]
+            logging.info(f"[V2]   Tool {len(tool_calls_made)+1}/{max_tools}: {tool_name}({args_str})")
+
+            # Record tool call
+            tool_id = tool_id_map.get(tool_name)
+            if tool_id:
+                create_tool_call_v2(
+                    db, attempt_id, len(tool_calls_made) + 1, tool_id, tool_name,
+                    input_data=json.dumps(tool_call.arguments),
+                    output=str(tool_result.output)
+                )
+
+            tool_calls_made.append({'name': tool_name, 'args': tool_call.arguments})
+
+            # Check tool limit
+            if len(tool_calls_made) >= max_tools:
+                logging.warning(f"[V2 Attempt {attempt_id}] Tool limit ({max_tools}) reached")
+                raise ToolLimitExceeded(f"Tool limit of {max_tools} exceeded")
+
+        try:
+            # Call LLM with tools
+            logging.info(f"[V2] Calling LLM {model_id}...")
+            model = llm.get_model(model_id)
+
+            # Get validation steps to include in prompt
+            validation_steps = get_validation_steps_v2(db, goal_id)
+            validation_text = ""
+            if validation_steps:
+                validation_text = "\n\n**Success criteria (validation commands):**\n"
+                validation_text += "Your changes will be validated by running these commands:\n"
+                for step in validation_steps:
+                    validation_text += f"- `{step['command']}`\n"
+                validation_text += "\n**IMPORTANT:** Run these validation commands yourself using the appropriate tools (e.g., bazel_build, bazel_test).\n"
+                validation_text += "Once ALL validation commands pass, STOP making changes and explain that you've completed the goal.\n"
+                validation_text += "Do NOT continue making unnecessary changes or writing documentation after validation passes."
+
+            system_prompt = f"""You are an autonomous coding agent working on a specific goal in a git repository.
 
 You have access to tools to read files, search code, modify files, and run Bazel commands.
 
@@ -1592,88 +1601,91 @@ Your task is to work towards achieving the goal. You should:
 
 When you have successfully achieved the goal (or determined it cannot be achieved), explain your final status clearly and STOP."""
 
-        chain = model.chain(
-            goal['goal_text'],
-            system=system_prompt,
-            tools=tool_functions,
-            after_call=after_call
-        )
+            chain = model.chain(
+                goal['goal_text'],
+                system=system_prompt,
+                tools=tool_functions,
+                after_call=after_call
+            )
 
-        response_text = chain.text()
-        logging.info(f"[V2] LLM completed - {len(tool_calls_made)} tools used")
+            response_text = chain.text()
+            logging.info(f"[V2] LLM completed - {len(tool_calls_made)} tools used")
 
-        # Check for uncommitted changes
-        status_result = subprocess.run(
-            ['git', 'status', '--porcelain'],
-            cwd=worktree_path,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        has_changes = bool(status_result.stdout.strip())
+            # Check for uncommitted changes
+            status_result = subprocess.run(
+                ['git', 'status', '--porcelain'],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            has_changes = bool(status_result.stdout.strip())
 
-        if has_changes:
-            # Commit all changes
-            logging.info(f"[V2] Committing changes made by LLM...")
-            subprocess.run(['git', 'add', '-A'], cwd=worktree_path, check=True, capture_output=True)
+            if has_changes:
+                # Commit all changes
+                logging.info(f"[V2] Committing changes made by LLM...")
+                subprocess.run(['git', 'add', '-A'], cwd=worktree_path, check=True, capture_output=True)
 
-            commit_msg = f"""[V2] Goal {goal_id}: {goal['goal_text']}
+                commit_msg = f"""[V2] Goal {goal_id}: {goal['goal_text']}
 
 Attempt {attempt_id} by {model_id}
 
 Prompt sent to LLM:
 {prompt}
 """
-            subprocess.run(
-                ['git', 'commit', '-m', commit_msg],
+                subprocess.run(
+                    ['git', 'commit', '-m', commit_msg],
+                    cwd=worktree_path,
+                    check=True,
+                    capture_output=True
+                )
+                logging.info(f"[V2] Changes committed")
+            else:
+                logging.info(f"[V2] No changes to commit")
+
+            # Get final commit SHA
+            result = subprocess.run(
+                ['git', 'rev-parse', 'HEAD'],
                 cwd=worktree_path,
-                check=True,
-                capture_output=True
+                capture_output=True,
+                text=True,
+                check=True
             )
-            logging.info(f"[V2] Changes committed")
-        else:
-            logging.info(f"[V2] No changes to commit")
+            end_sha = result.stdout.strip()
 
-        # Get final commit SHA
-        result = subprocess.run(
-            ['git', 'rev-parse', 'HEAD'],
-            cwd=worktree_path,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        end_sha = result.stdout.strip()
+            # Get diff between start and end
+            diff_result = subprocess.run(
+                ['git', 'diff', current_sha, end_sha],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True
+            )
+            diff = diff_result.stdout
 
-        # Get diff between start and end
-        diff_result = subprocess.run(
-            ['git', 'diff', current_sha, end_sha],
-            cwd=worktree_path,
-            capture_output=True,
-            text=True
-        )
-        diff = diff_result.stdout
+            status = "completed"  # LLM finished
+            status_detail = f"Used {len(tool_calls_made)} tools"
 
-        status = "completed"  # LLM finished
-        status_detail = f"Used {len(tool_calls_made)} tools"
-
-    except LLMTimeoutError as e:
-        logging.error(f"[V2] Timeout: {e}")
-        end_sha = current_sha
-        diff = ""
-        status = "timeout"
-        status_detail = str(e)
-    except ToolLimitExceeded as e:
-        logging.error(f"[V2] Tool limit exceeded: {e}")
-        end_sha = current_sha
-        diff = ""
-        status = "tool_limit"
-        status_detail = str(e)
-    except Exception as e:
-        logging.error(f"[V2] Error: {e}")
-        end_sha = current_sha
-        diff = ""
-        status = "error"
-        status_detail = str(e)
+        except LLMTimeoutError as e:
+            logging.error(f"[V2] Timeout: {e}")
+            end_sha = current_sha
+            diff = ""
+            status = "timeout"
+            status_detail = str(e)
+        except ToolLimitExceeded as e:
+            logging.error(f"[V2] Tool limit exceeded: {e}")
+            end_sha = current_sha
+            diff = ""
+            status = "tool_limit"
+            status_detail = str(e)
+        except Exception as e:
+            logging.error(f"[V2] Error: {e}")
+            end_sha = current_sha
+            diff = ""
+            status = "error"
+            status_detail = str(e)
+    finally:
+        # Stop the container
+        container.stop()
 
     # Create attempt result
     result_id = create_attempt_result_v2(
@@ -1892,7 +1904,8 @@ def breakdown_goal_v2(db, session_id, goal_id, failed_attempt_id, model_id, repo
 def work_on_goal_v2_recursive(db, session_id, goal_id, repo_path,
                                model_a, model_b, current_model=None,
                                max_decompositions=5, decomposition_count=0,
-                               depth=0, max_depth=5, max_tools=50):
+                               depth=0, max_depth=5, max_tools=50,
+                               image='shots-on-goal:latest', runtime='container'):
     """
     Recursively work on a goal with ping-pong model alternation and breakdown.
 
@@ -1951,7 +1964,9 @@ def work_on_goal_v2_recursive(db, session_id, goal_id, repo_path,
             repo_path=repo_path,
             model_id=model_to_use,
             attempt_type='implementation',
-            max_tools=max_tools
+            max_tools=max_tools,
+            image=image,
+            runtime=runtime
         )
 
         if result['success']:
@@ -2011,7 +2026,9 @@ def work_on_goal_v2_recursive(db, session_id, goal_id, repo_path,
             decomposition_count=decomposition_count + 1,
             depth=depth + 1,
             max_depth=max_depth,
-            max_tools=max_tools
+            max_tools=max_tools,
+            image=image,
+            runtime=runtime
         )
 
         if not success:
@@ -2720,6 +2737,21 @@ class ToolExecutor:
                 'error': result.stderr
             }
 
+    def read_multiple_files(self, paths):
+        """
+        Read multiple files from the workspace at once.
+
+        Args:
+            paths: List of file paths relative to workspace root
+
+        Returns:
+            dict mapping path to result dict with 'success', 'content', 'error'
+        """
+        results = {}
+        for path in paths:
+            results[path] = self.read_file(path)
+        return results
+
     def write_file(self, path, content):
         """
         Write content to a file in the workspace.
@@ -2913,6 +2945,25 @@ def create_tool_functions(tools_executor):
         else:
             return f"ERROR: {result['error']}"
 
+    def read_multiple_files(paths: list) -> str:
+        """
+        Read multiple files at once (more efficient than calling read_file multiple times).
+
+        Args:
+            paths: List of file paths relative to workspace root
+
+        Returns:
+            Formatted string with contents of each file, separated by headers
+        """
+        results = tools_executor.read_multiple_files(paths)
+        output = []
+        for path, result in results.items():
+            if result['success']:
+                output.append(f"=== {path} ===\n{result['content']}")
+            else:
+                output.append(f"=== {path} ===\nERROR: {result['error']}")
+        return "\n\n".join(output) if output else "No files read"
+
     def write_file(path: str, content: str) -> str:
         """
         Write content to a file in the workspace.
@@ -3075,6 +3126,7 @@ def create_tool_functions(tools_executor):
 
     return [
         read_file,
+        read_multiple_files,
         write_file,
         find_replace_in_file,
         list_directory,
@@ -4149,7 +4201,9 @@ def main():
                 model_b=args.model_b,
                 max_decompositions=args.max_goal_breakdowns,
                 max_depth=args.max_goal_breakdowns,  # Use same limit for depth
-                max_tools=args.max_tools
+                max_tools=args.max_tools,
+                image=args.image,
+                runtime=detect_container_runtime()
             )
 
             logging.info("=" * 80)
