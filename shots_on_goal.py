@@ -1852,7 +1852,7 @@ def breakdown_goal_v2(db, session_id, goal_id, failed_attempt_id, model_id, repo
 def work_on_goal_v2_recursive(db, session_id, goal_id, repo_path,
                                model_a, model_b, current_model=None,
                                max_decompositions=5, decomposition_count=0,
-                               depth=0, max_depth=5):
+                               depth=0, max_depth=5, max_tools=50):
     """
     Recursively work on a goal with ping-pong model alternation and breakdown.
 
@@ -1874,6 +1874,7 @@ def work_on_goal_v2_recursive(db, session_id, goal_id, repo_path,
         decomposition_count: Current decomposition depth
         depth: Current recursion depth
         max_depth: Max recursion depth
+        max_tools: Max tool calls per attempt
 
     Returns:
         bool: True if goal succeeded, False otherwise
@@ -1909,7 +1910,8 @@ def work_on_goal_v2_recursive(db, session_id, goal_id, repo_path,
             goal_id=goal_id,
             repo_path=repo_path,
             model_id=model_to_use,
-            attempt_type='implementation'
+            attempt_type='implementation',
+            max_tools=max_tools
         )
 
         if result['success']:
@@ -1968,7 +1970,8 @@ def work_on_goal_v2_recursive(db, session_id, goal_id, repo_path,
             max_decompositions=max_decompositions,
             decomposition_count=decomposition_count + 1,
             depth=depth + 1,
-            max_depth=max_depth
+            max_depth=max_depth,
+            max_tools=max_tools
         )
 
         if not success:
@@ -3962,10 +3965,10 @@ def main():
         help='Maximum number of tool calls per attempt (default: 50)'
     )
     parser.add_argument(
-        '--max-decompositions',
+        '--max-goal-breakdowns',
         type=int,
         default=5,
-        help='Maximum number of decompositions before giving up (default: 5)'
+        help='Maximum number of goal breakdowns before giving up (default: 5)'
     )
     parser.add_argument(
         '--verbose',
@@ -4046,7 +4049,7 @@ def main():
             initial_goal=args.goal,
             model_a=args.model_a,
             model_b=args.model_b,
-            flags={'max_tools': args.max_tools, 'max_decompositions': args.max_decompositions},
+            flags={'max_tools': args.max_tools, 'max_goal_breakdowns': args.max_goal_breakdowns},
             repo_path=str(repo_path),
             base_branch=base_branch
         )
@@ -4103,8 +4106,9 @@ def main():
                 repo_path=str(repo_path),
                 model_a=args.model_a,
                 model_b=args.model_b,
-                max_decompositions=args.max_decompositions,
-                max_depth=5
+                max_decompositions=args.max_goal_breakdowns,
+                max_depth=args.max_goal_breakdowns,  # Use same limit for depth
+                max_tools=args.max_tools
             )
 
             logging.info("=" * 80)
@@ -4191,7 +4195,7 @@ def main():
             model_a=args.model_a,
             model_b=args.model_b,
             max_tools=args.max_tools,
-            max_decompositions=args.max_decompositions
+            max_decompositions=args.max_goal_breakdowns
         )
 
         logging.info("=" * 80)
