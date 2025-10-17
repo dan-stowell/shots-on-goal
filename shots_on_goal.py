@@ -219,6 +219,501 @@ def init_database(db_path):
 
 
 # ============================================================================
+# Database Setup V2 (New Schema)
+# ============================================================================
+
+def init_database_v2(db_path):
+    """
+    Initialize SQLite database with V2 schema.
+    This is the new append-only, event-based schema.
+    Returns connection object.
+    """
+    db = sqlite3.connect(db_path)
+    db.row_factory = sqlite3.Row
+
+    # Enable foreign key constraints
+    db.execute("PRAGMA foreign_keys = ON")
+
+    cursor = db.cursor()
+
+    # Session table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS session (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            initial_goal TEXT NOT NULL,
+            model_a TEXT NOT NULL,
+            model_b TEXT NOT NULL,
+            flags TEXT,  -- JSON
+            repo_path TEXT NOT NULL,
+            base_branch TEXT NOT NULL
+        )
+    """)
+
+    # Tool table (session-scoped tool definitions)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tool (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            session_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            FOREIGN KEY (session_id) REFERENCES session(id)
+        )
+    """)
+
+    # Goal table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS goal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            session_id INTEGER NOT NULL,
+            goal_text TEXT NOT NULL,
+            parent_goal_id INTEGER,
+            order_num INTEGER,  -- renamed from 'order' to avoid SQL keyword
+            source TEXT,  -- 'cli' or 'breakdown'
+            created_by_attempt_id INTEGER,
+            FOREIGN KEY (session_id) REFERENCES session(id),
+            FOREIGN KEY (parent_goal_id) REFERENCES goal(id),
+            FOREIGN KEY (created_by_attempt_id) REFERENCES attempt(id)
+        )
+    """)
+
+    # Validation step table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS validation_step (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            goal_id INTEGER NOT NULL,
+            order_num INTEGER NOT NULL,
+            command TEXT NOT NULL,
+            source TEXT,
+            FOREIGN KEY (goal_id) REFERENCES goal(id)
+        )
+    """)
+
+    # Branch table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS branch (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            session_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            parent_branch_id INTEGER,
+            parent_commit_sha TEXT,
+            reason TEXT,
+            created_by_goal_id INTEGER,
+            FOREIGN KEY (session_id) REFERENCES session(id),
+            FOREIGN KEY (parent_branch_id) REFERENCES branch(id),
+            FOREIGN KEY (created_by_goal_id) REFERENCES goal(id)
+        )
+    """)
+
+    # Worktree table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS worktree (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            branch_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            start_sha TEXT NOT NULL,
+            reason TEXT,
+            FOREIGN KEY (branch_id) REFERENCES branch(id)
+        )
+    """)
+
+    # Attempt table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS attempt (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            goal_id INTEGER NOT NULL,
+            worktree_id INTEGER NOT NULL,
+            start_commit_sha TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            model TEXT NOT NULL,
+            attempt_type TEXT NOT NULL,  -- 'implementation' or 'breakdown'
+            FOREIGN KEY (goal_id) REFERENCES goal(id),
+            FOREIGN KEY (worktree_id) REFERENCES worktree(id)
+        )
+    """)
+
+    # Attempt tool junction table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS attempt_tool (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            attempt_id INTEGER NOT NULL,
+            tool_id INTEGER NOT NULL,
+            FOREIGN KEY (attempt_id) REFERENCES attempt(id),
+            FOREIGN KEY (tool_id) REFERENCES tool(id)
+        )
+    """)
+
+    # Attempt result table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS attempt_result (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            attempt_id INTEGER NOT NULL,
+            end_commit_sha TEXT,
+            diff TEXT,
+            status TEXT NOT NULL,  -- 'success', 'error', 'timeout', 'tool_limit', 'completed'
+            status_detail TEXT,
+            FOREIGN KEY (attempt_id) REFERENCES attempt(id)
+        )
+    """)
+
+    # Tool call table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tool_call (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            attempt_id INTEGER NOT NULL,
+            order_num INTEGER NOT NULL,
+            tool_id INTEGER NOT NULL,
+            tool_name TEXT NOT NULL,  -- denormalized for convenience
+            input TEXT,  -- JSON
+            output TEXT,
+            FOREIGN KEY (attempt_id) REFERENCES attempt(id),
+            FOREIGN KEY (tool_id) REFERENCES tool(id)
+        )
+    """)
+
+    # Validation run table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS validation_run (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            validation_step_id INTEGER NOT NULL,
+            attempt_result_id INTEGER NOT NULL,
+            exit_code INTEGER NOT NULL,
+            output TEXT,
+            FOREIGN KEY (validation_step_id) REFERENCES validation_step(id),
+            FOREIGN KEY (attempt_result_id) REFERENCES attempt_result(id)
+        )
+    """)
+
+    # Merge table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS merge (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            from_branch_id INTEGER NOT NULL,
+            from_commit_sha TEXT NOT NULL,
+            to_branch_id INTEGER NOT NULL,
+            to_commit_sha TEXT NOT NULL,
+            result_commit_sha TEXT NOT NULL,
+            FOREIGN KEY (from_branch_id) REFERENCES branch(id),
+            FOREIGN KEY (to_branch_id) REFERENCES branch(id)
+        )
+    """)
+
+    # Create indexes for common queries
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_goal_session ON goal(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_goal_parent ON goal(parent_goal_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_attempt_goal ON attempt(goal_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tool_call_attempt ON tool_call(attempt_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_validation_run_step ON validation_run(validation_step_id)")
+
+    db.commit()
+    return db
+
+
+# ============================================================================
+# Database Helper Functions V2
+# ============================================================================
+
+def create_session_v2(db, initial_goal, model_a, model_b, flags, repo_path, base_branch):
+    """Create a session record in V2 schema."""
+    cursor = db.execute(
+        """
+        INSERT INTO session (initial_goal, model_a, model_b, flags, repo_path, base_branch)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (initial_goal, model_a, model_b, json.dumps(flags), repo_path, base_branch)
+    )
+    db.commit()
+    return cursor.lastrowid
+
+
+def get_session_v2(db, session_id):
+    """Get a session by ID."""
+    row = db.execute("SELECT * FROM session WHERE id = ?", (session_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def create_tool_v2(db, session_id, name, description=""):
+    """Create a tool definition."""
+    cursor = db.execute(
+        """
+        INSERT INTO tool (session_id, name, description)
+        VALUES (?, ?, ?)
+        """,
+        (session_id, name, description)
+    )
+    db.commit()
+    return cursor.lastrowid
+
+
+def get_tool_v2(db, tool_id):
+    """Get a tool by ID."""
+    row = db.execute("SELECT * FROM tool WHERE id = ?", (tool_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_tools_for_session_v2(db, session_id):
+    """Get all tools for a session."""
+    rows = db.execute("SELECT * FROM tool WHERE session_id = ?", (session_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_goal_v2(db, session_id, goal_text, parent_goal_id=None, order_num=None,
+                   source='cli', created_by_attempt_id=None):
+    """Create a goal record."""
+    cursor = db.execute(
+        """
+        INSERT INTO goal (session_id, goal_text, parent_goal_id, order_num, source, created_by_attempt_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (session_id, goal_text, parent_goal_id, order_num, source, created_by_attempt_id)
+    )
+    db.commit()
+    return cursor.lastrowid
+
+
+def get_goal_v2(db, goal_id):
+    """Get a goal by ID."""
+    row = db.execute("SELECT * FROM goal WHERE id = ?", (goal_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_child_goals_v2(db, parent_goal_id):
+    """Get all child goals of a parent goal, ordered by order_num."""
+    rows = db.execute(
+        "SELECT * FROM goal WHERE parent_goal_id = ? ORDER BY order_num",
+        (parent_goal_id,)
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_validation_step_v2(db, goal_id, order_num, command, source='cli'):
+    """Create a validation step."""
+    cursor = db.execute(
+        """
+        INSERT INTO validation_step (goal_id, order_num, command, source)
+        VALUES (?, ?, ?, ?)
+        """,
+        (goal_id, order_num, command, source)
+    )
+    db.commit()
+    return cursor.lastrowid
+
+
+def get_validation_steps_v2(db, goal_id):
+    """Get all validation steps for a goal, ordered by order_num."""
+    rows = db.execute(
+        "SELECT * FROM validation_step WHERE goal_id = ? ORDER BY order_num",
+        (goal_id,)
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_branch_v2(db, session_id, name, parent_branch_id=None,
+                     parent_commit_sha=None, reason=None, created_by_goal_id=None):
+    """Create a branch record."""
+    cursor = db.execute(
+        """
+        INSERT INTO branch (session_id, name, parent_branch_id, parent_commit_sha, reason, created_by_goal_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (session_id, name, parent_branch_id, parent_commit_sha, reason, created_by_goal_id)
+    )
+    db.commit()
+    return cursor.lastrowid
+
+
+def get_branch_v2(db, branch_id):
+    """Get a branch by ID."""
+    row = db.execute("SELECT * FROM branch WHERE id = ?", (branch_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_branch_by_name_v2(db, session_id, name):
+    """Get a branch by name within a session."""
+    row = db.execute(
+        "SELECT * FROM branch WHERE session_id = ? AND name = ?",
+        (session_id, name)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def create_worktree_v2(db, branch_id, path, start_sha, reason=None):
+    """Create a worktree record."""
+    cursor = db.execute(
+        """
+        INSERT INTO worktree (branch_id, path, start_sha, reason)
+        VALUES (?, ?, ?, ?)
+        """,
+        (branch_id, path, start_sha, reason)
+    )
+    db.commit()
+    return cursor.lastrowid
+
+
+def get_worktree_v2(db, worktree_id):
+    """Get a worktree by ID."""
+    row = db.execute("SELECT * FROM worktree WHERE id = ?", (worktree_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def create_attempt_v2(db, goal_id, worktree_id, start_commit_sha, prompt, model, attempt_type):
+    """Create an attempt record."""
+    cursor = db.execute(
+        """
+        INSERT INTO attempt (goal_id, worktree_id, start_commit_sha, prompt, model, attempt_type)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (goal_id, worktree_id, start_commit_sha, prompt, model, attempt_type)
+    )
+    db.commit()
+    return cursor.lastrowid
+
+
+def get_attempt_v2(db, attempt_id):
+    """Get an attempt by ID."""
+    row = db.execute("SELECT * FROM attempt WHERE id = ?", (attempt_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_attempts_for_goal_v2(db, goal_id):
+    """Get all attempts for a goal."""
+    rows = db.execute(
+        "SELECT * FROM attempt WHERE goal_id = ? ORDER BY timestamp",
+        (goal_id,)
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_attempt_tool_v2(db, attempt_id, tool_id):
+    """Link a tool to an attempt."""
+    cursor = db.execute(
+        """
+        INSERT INTO attempt_tool (attempt_id, tool_id)
+        VALUES (?, ?)
+        """,
+        (attempt_id, tool_id)
+    )
+    db.commit()
+    return cursor.lastrowid
+
+
+def get_tools_for_attempt_v2(db, attempt_id):
+    """Get all tools available to an attempt."""
+    rows = db.execute(
+        """
+        SELECT t.* FROM tool t
+        JOIN attempt_tool at ON t.id = at.tool_id
+        WHERE at.attempt_id = ?
+        ORDER BY t.name
+        """,
+        (attempt_id,)
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_attempt_result_v2(db, attempt_id, end_commit_sha, diff, status, status_detail=None):
+    """Create an attempt result record."""
+    cursor = db.execute(
+        """
+        INSERT INTO attempt_result (attempt_id, end_commit_sha, diff, status, status_detail)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (attempt_id, end_commit_sha, diff, status, status_detail)
+    )
+    db.commit()
+    return cursor.lastrowid
+
+
+def get_attempt_result_v2(db, attempt_result_id):
+    """Get an attempt result by ID."""
+    row = db.execute("SELECT * FROM attempt_result WHERE id = ?", (attempt_result_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_attempt_result_by_attempt_v2(db, attempt_id):
+    """Get the attempt result for an attempt."""
+    row = db.execute(
+        "SELECT * FROM attempt_result WHERE attempt_id = ?",
+        (attempt_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def create_tool_call_v2(db, attempt_id, order_num, tool_id, tool_name, input_data, output):
+    """Create a tool call record."""
+    cursor = db.execute(
+        """
+        INSERT INTO tool_call (attempt_id, order_num, tool_id, tool_name, input, output)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (attempt_id, order_num, tool_id, tool_name, input_data, output)
+    )
+    db.commit()
+    return cursor.lastrowid
+
+
+def get_tool_calls_v2(db, attempt_id):
+    """Get all tool calls for an attempt, ordered by order_num."""
+    rows = db.execute(
+        "SELECT * FROM tool_call WHERE attempt_id = ? ORDER BY order_num",
+        (attempt_id,)
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_validation_run_v2(db, validation_step_id, attempt_result_id, exit_code, output):
+    """Create a validation run record."""
+    cursor = db.execute(
+        """
+        INSERT INTO validation_run (validation_step_id, attempt_result_id, exit_code, output)
+        VALUES (?, ?, ?, ?)
+        """,
+        (validation_step_id, attempt_result_id, exit_code, output)
+    )
+    db.commit()
+    return cursor.lastrowid
+
+
+def get_validation_runs_v2(db, attempt_result_id):
+    """Get all validation runs for an attempt result."""
+    rows = db.execute(
+        "SELECT * FROM validation_run WHERE attempt_result_id = ? ORDER BY timestamp",
+        (attempt_result_id,)
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_merge_v2(db, from_branch_id, from_commit_sha, to_branch_id, to_commit_sha, result_commit_sha):
+    """Create a merge record."""
+    cursor = db.execute(
+        """
+        INSERT INTO merge (from_branch_id, from_commit_sha, to_branch_id, to_commit_sha, result_commit_sha)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (from_branch_id, from_commit_sha, to_branch_id, to_commit_sha, result_commit_sha)
+    )
+    db.commit()
+    return cursor.lastrowid
+
+
+def get_merge_v2(db, merge_id):
+    """Get a merge by ID."""
+    row = db.execute("SELECT * FROM merge WHERE id = ?", (merge_id,)).fetchone()
+    return dict(row) if row else None
+
+
+# ============================================================================
 # Database Helper Functions
 # ============================================================================
 
