@@ -46,6 +46,8 @@ from shots_on_goal import (
     get_attempts_summary_v2,
     # Orchestration
     work_on_goal_v2_simple,
+    breakdown_goal_v2,
+    work_on_goal_v2_recursive,
 )
 
 
@@ -361,6 +363,138 @@ class SchemaV2TestCase(unittest.TestCase):
             self.assertGreater(len(tool_calls), 0)
 
             # Verify validation runs
+            validation_status = get_validation_status_v2(self.db, goal_id)
+            self.assertTrue(validation_status['has_validation'])
+            self.assertTrue(validation_status['all_passed'])
+
+    def test_breakdown_goal_v2(self):
+        """Test goal breakdown functionality."""
+        import tempfile
+        import subprocess
+        import os
+
+        # Create temp git repo
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Initialize git repo
+            subprocess.run(['git', 'init'], cwd=tmpdir, check=True, capture_output=True)
+            subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=tmpdir, check=True)
+            subprocess.run(['git', 'config', 'user.name', 'Test User'], cwd=tmpdir, check=True)
+
+            # Create initial commit
+            readme_path = os.path.join(tmpdir, 'README.md')
+            with open(readme_path, 'w') as f:
+                f.write('# Test Repo\n')
+            subprocess.run(['git', 'add', '.'], cwd=tmpdir, check=True, capture_output=True)
+            subprocess.run(['git', 'commit', '-m', 'Initial commit'], cwd=tmpdir, check=True, capture_output=True)
+
+            # Create session with tools
+            session_id = create_session_v2(self.db, "Test", "model-a", "model-b", {}, tmpdir, "main")
+            tool1 = create_tool_v2(self.db, session_id, "read_file", "Read a file")
+            tool2 = create_tool_v2(self.db, session_id, "list_directory", "List directory")
+
+            # Create a parent goal
+            parent_goal_id = create_goal_v2(self.db, session_id, "Complex goal that needs breakdown")
+
+            # Create a failed attempt
+            branch_id = create_branch_v2(self.db, session_id, "feature", created_by_goal_id=parent_goal_id)
+            worktree_id = create_worktree_v2(self.db, branch_id, f"{tmpdir}/wt1", "abc")
+            failed_attempt_id = create_attempt_v2(
+                self.db, parent_goal_id, worktree_id, "abc", "prompt", "model-a", "implementation"
+            )
+            create_attempt_result_v2(self.db, failed_attempt_id, "abc", "diff", "error", "Failed to complete")
+
+            # Break down the goal
+            breakdown_attempt_id, sub_goal_ids = breakdown_goal_v2(
+                self.db, session_id, parent_goal_id, failed_attempt_id, "model-b", tmpdir
+            )
+
+            # Verify breakdown attempt was created
+            breakdown_attempt = get_attempt_v2(self.db, breakdown_attempt_id)
+            self.assertIsNotNone(breakdown_attempt)
+            self.assertEqual(breakdown_attempt['attempt_type'], 'breakdown')
+            self.assertEqual(breakdown_attempt['model'], 'model-b')
+            self.assertEqual(breakdown_attempt['goal_id'], parent_goal_id)
+
+            # Verify breakdown attempt has tools linked
+            breakdown_tools = get_tools_for_attempt_v2(self.db, breakdown_attempt_id)
+            self.assertGreater(len(breakdown_tools), 0)
+
+            # Verify breakdown attempt has tool calls
+            breakdown_tool_calls = get_tool_calls_v2(self.db, breakdown_attempt_id)
+            self.assertGreater(len(breakdown_tool_calls), 0)
+
+            # Verify breakdown attempt has result
+            breakdown_result = get_attempt_result_by_attempt_v2(self.db, breakdown_attempt_id)
+            self.assertIsNotNone(breakdown_result)
+            self.assertEqual(breakdown_result['status'], 'success')
+
+            # Verify sub-goals were created
+            self.assertEqual(len(sub_goal_ids), 3)
+
+            # Verify sub-goals have correct linkage to BREAKDOWN attempt (not failed attempt)
+            for i, sub_goal_id in enumerate(sub_goal_ids, 1):
+                sub_goal = get_goal_v2(self.db, sub_goal_id)
+                self.assertEqual(sub_goal['parent_goal_id'], parent_goal_id)
+                self.assertEqual(sub_goal['created_by_attempt_id'], breakdown_attempt_id)  # Link to breakdown!
+                self.assertEqual(sub_goal['source'], 'breakdown')
+                self.assertEqual(sub_goal['order_num'], i)
+                self.assertIn("Sub-goal", sub_goal['goal_text'])
+
+            # Verify parent goal has children
+            children = get_child_goals_v2(self.db, parent_goal_id)
+            self.assertEqual(len(children), 3)
+
+    def test_work_on_goal_v2_recursive(self):
+        """Test recursive orchestration with breakdown."""
+        import tempfile
+        import subprocess
+        import os
+
+        # Create temp git repo
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Initialize git repo
+            subprocess.run(['git', 'init'], cwd=tmpdir, check=True, capture_output=True)
+            subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=tmpdir, check=True)
+            subprocess.run(['git', 'config', 'user.name', 'Test User'], cwd=tmpdir, check=True)
+
+            # Create initial commit
+            readme_path = os.path.join(tmpdir, 'README.md')
+            with open(readme_path, 'w') as f:
+                f.write('# Test Repo\n')
+            subprocess.run(['git', 'add', '.'], cwd=tmpdir, check=True, capture_output=True)
+            subprocess.run(['git', 'commit', '-m', 'Initial commit'], cwd=tmpdir, check=True, capture_output=True)
+
+            # Create session
+            session_id = create_session_v2(self.db, "Test goal", "model-a", "model-b", {}, tmpdir, "main")
+
+            # Create tools
+            create_tool_v2(self.db, session_id, "read_file", "Read a file")
+            create_tool_v2(self.db, session_id, "write_file", "Write a file")
+
+            # Create goal with validation that will succeed
+            goal_id = create_goal_v2(self.db, session_id, "Add BUILD file")
+            create_validation_step_v2(self.db, goal_id, 1, "test -f BUILD", "cli")
+
+            # Run recursive orchestration
+            # This should succeed on first attempt (no breakdown needed)
+            success = work_on_goal_v2_recursive(
+                self.db, session_id, goal_id, tmpdir,
+                model_a="model-a", model_b="model-b",
+                max_decompositions=3, max_depth=3
+            )
+
+            # Verify success
+            self.assertTrue(success)
+
+            # Verify at least one attempt was created
+            attempts = get_attempts_for_goal_v2(self.db, goal_id)
+            self.assertGreater(len(attempts), 0)
+
+            # Verify the attempt has a result
+            result = get_attempt_result_by_attempt_v2(self.db, attempts[0]['id'])
+            self.assertIsNotNone(result)
+
+            # Check if validation passed
             validation_status = get_validation_status_v2(self.db, goal_id)
             self.assertTrue(validation_status['has_validation'])
             self.assertTrue(validation_status['all_passed'])

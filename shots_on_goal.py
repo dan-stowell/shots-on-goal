@@ -1180,6 +1180,286 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
     }
 
 
+def breakdown_goal_v2(db, session_id, goal_id, failed_attempt_id, model_id, repo_path):
+    """
+    Break down a goal into sub-goals using an LLM (breakdown attempt).
+
+    Creates a proper breakdown attempt (with attempt_type='breakdown') that:
+    1. Creates branch/worktree for isolation
+    2. Records the breakdown attempt with read-only tools
+    3. Simulates LLM analysis (would call real LLM in production)
+    4. Records tool calls made during breakdown
+    5. Creates attempt_result for the breakdown
+    6. Creates sub-goals linked to the breakdown attempt
+
+    Args:
+        db: Database connection
+        session_id: Session ID
+        goal_id: Goal that failed
+        failed_attempt_id: The attempt that failed
+        model_id: Model to use for breakdown
+        repo_path: Path to repository
+
+    Returns:
+        Tuple of (breakdown_attempt_id, sub_goal_ids)
+    """
+    goal = get_goal_v2(db, goal_id)
+    failed_attempt = get_attempt_v2(db, failed_attempt_id)
+
+    if not goal or not failed_attempt:
+        raise ValueError("Goal or failed attempt not found")
+
+    logging.info(f"[V2 Breakdown] Breaking down goal {goal_id} after attempt {failed_attempt_id} failed")
+
+    # Get current commit SHA
+    result = subprocess.run(['git', 'rev-parse', 'HEAD'],
+                          cwd=repo_path, capture_output=True,
+                          text=True, check=True)
+    current_sha = result.stdout.strip()
+
+    # Create branch for breakdown
+    branch_name = f"goal-{goal_id}-breakdown"
+    existing_branch = get_branch_by_name_v2(db, session_id, branch_name)
+    if existing_branch:
+        branch_id = existing_branch['id']
+    else:
+        branch_id = create_branch_v2(
+            db, session_id,
+            name=branch_name,
+            parent_commit_sha=current_sha,
+            reason=f"Breakdown for goal {goal_id}",
+            created_by_goal_id=goal_id
+        )
+
+    # Create worktree for breakdown
+    worktree_path = f"{repo_path}/worktrees/goal-{goal_id}-breakdown"
+    worktree_id = create_worktree_v2(
+        db, branch_id, worktree_path, current_sha,
+        reason=f"Breakdown attempt for goal {goal_id}"
+    )
+
+    # Create breakdown attempt
+    prompt = f"Analyze goal '{goal['goal_text']}' and break it down into sub-goals."
+    breakdown_attempt_id = create_attempt_v2(
+        db, goal_id, worktree_id, current_sha,
+        prompt, model_id, attempt_type='breakdown'
+    )
+
+    logging.info(f"[V2 Breakdown] Created breakdown attempt {breakdown_attempt_id}")
+
+    # Get read-only tools for this session
+    all_tools = get_tools_for_session_v2(db, session_id)
+    # In real implementation, filter to read-only tools (list_directory, read_file, etc.)
+    # For simulation, just use first 2 tools as "read-only"
+    read_only_tools = all_tools[:min(2, len(all_tools))]
+
+    # Link read-only tools to breakdown attempt
+    for tool in read_only_tools:
+        create_attempt_tool_v2(db, breakdown_attempt_id, tool['id'])
+
+    # Simulate LLM breakdown with read-only tools
+    # In real implementation, this would call the LLM with read-only tools
+    # and parse the response to extract sub-goals
+    tool_call_count = 0
+    for tool in read_only_tools:
+        tool_call_count += 1
+        create_tool_call_v2(
+            db, breakdown_attempt_id, tool_call_count, tool['id'],
+            tool['name'],
+            input_data='{"simulated": "input"}',
+            output="Simulated output from breakdown analysis"
+        )
+
+    # Simulated sub-goals (in real implementation, parsed from LLM response)
+    sub_goals_data = [
+        {
+            "goal_text": f"Sub-goal 1 of: {goal['goal_text'][:40]}...",
+            "validation_commands": []
+        },
+        {
+            "goal_text": f"Sub-goal 2 of: {goal['goal_text'][:40]}...",
+            "validation_commands": []
+        },
+        {
+            "goal_text": f"Sub-goal 3 of: {goal['goal_text'][:40]}...",
+            "validation_commands": []
+        }
+    ]
+
+    # Create attempt_result for breakdown (status='success' since we got sub-goals)
+    breakdown_result_id = create_attempt_result_v2(
+        db, breakdown_attempt_id,
+        end_commit_sha=current_sha,  # No changes during breakdown
+        diff="",  # No diff for read-only breakdown
+        status="success",
+        status_detail=f"Broke down into {len(sub_goals_data)} sub-goals"
+    )
+
+    logging.info(f"[V2 Breakdown] Created breakdown result {breakdown_result_id}")
+
+    # Create sub-goals linked to breakdown attempt
+    sub_goal_ids = []
+    for i, sub_goal_data in enumerate(sub_goals_data, 1):
+        sub_goal_id = create_goal_v2(
+            db,
+            session_id=session_id,
+            goal_text=sub_goal_data['goal_text'],
+            parent_goal_id=goal_id,
+            order_num=i,
+            source='breakdown',
+            created_by_attempt_id=breakdown_attempt_id  # Link to breakdown attempt!
+        )
+
+        # Create validation steps if specified
+        for j, val_cmd in enumerate(sub_goal_data.get('validation_commands', []), 1):
+            create_validation_step_v2(
+                db,
+                goal_id=sub_goal_id,
+                order_num=j,
+                command=val_cmd,
+                source='breakdown'
+            )
+
+        sub_goal_ids.append(sub_goal_id)
+        logging.info(f"[V2 Breakdown] Created sub-goal {i}/{len(sub_goals_data)}: {sub_goal_data['goal_text'][:50]}")
+
+    return (breakdown_attempt_id, sub_goal_ids)
+
+
+def work_on_goal_v2_recursive(db, session_id, goal_id, repo_path,
+                               model_a, model_b, current_model=None,
+                               max_decompositions=5, decomposition_count=0,
+                               depth=0, max_depth=5):
+    """
+    Recursively work on a goal with ping-pong model alternation and breakdown.
+
+    Flow:
+    1. Try with current model (or model_a if first attempt)
+    2. If succeeds -> done
+    3. If fails -> other model performs breakdown
+    4. Other model works on sub-goals recursively
+
+    Args:
+        db: Database connection
+        session_id: Session ID
+        goal_id: Goal to work on
+        repo_path: Repository path
+        model_a: First model
+        model_b: Second model
+        current_model: Currently active model (None means start with model_a)
+        max_decompositions: Max decompositions allowed
+        decomposition_count: Current decomposition depth
+        depth: Current recursion depth
+        max_depth: Max recursion depth
+
+    Returns:
+        bool: True if goal succeeded, False otherwise
+    """
+    indent = "  " * depth
+
+    # Check limits
+    if decomposition_count >= max_decompositions:
+        logging.warning(f"{indent}[V2] Max decompositions ({max_decompositions}) reached for goal {goal_id}")
+        return False
+
+    if depth >= max_depth:
+        logging.warning(f"{indent}[V2] Max depth ({max_depth}) reached for goal {goal_id}")
+        return False
+
+    # Determine which model to use
+    if current_model is None:
+        model_to_use = model_a
+        other_model = model_b
+    else:
+        model_to_use = current_model
+        other_model = model_b if current_model == model_a else model_a
+
+    goal = get_goal_v2(db, goal_id)
+    logging.info(f"{indent}[V2] Working on goal {goal_id}: {goal['goal_text'][:50]}")
+    logging.info(f"{indent}[V2] Using model: {model_to_use}")
+
+    # Attempt to complete the goal
+    try:
+        result = work_on_goal_v2_simple(
+            db,
+            session_id=session_id,
+            goal_id=goal_id,
+            repo_path=repo_path,
+            model_id=model_to_use,
+            attempt_type='implementation'
+        )
+
+        if result['success']:
+            logging.info(f"{indent}[V2] ✓ Goal {goal_id} succeeded")
+            return True
+        else:
+            logging.info(f"{indent}[V2] ✗ Goal {goal_id} failed")
+
+    except Exception as e:
+        logging.error(f"{indent}[V2] ✗ Goal {goal_id} failed with error: {e}")
+        result = {'success': False, 'attempt_id': None}
+
+    # Attempt failed - break down with other model
+    if result.get('attempt_id'):
+        failed_attempt_id = result['attempt_id']
+    else:
+        logging.error(f"{indent}[V2] No attempt ID available for breakdown, cannot continue")
+        return False
+
+    logging.info(f"{indent}[V2] Breaking down goal {goal_id} with {other_model}")
+
+    # Perform breakdown
+    try:
+        breakdown_attempt_id, sub_goal_ids = breakdown_goal_v2(
+            db,
+            session_id=session_id,
+            goal_id=goal_id,
+            failed_attempt_id=failed_attempt_id,
+            model_id=other_model,
+            repo_path=repo_path
+        )
+        logging.info(f"{indent}[V2] Breakdown attempt {breakdown_attempt_id} completed")
+    except Exception as e:
+        logging.error(f"{indent}[V2] Breakdown failed: {e}")
+        return False
+
+    if not sub_goal_ids:
+        logging.error(f"{indent}[V2] No sub-goals created during breakdown")
+        return False
+
+    logging.info(f"{indent}[V2] Created {len(sub_goal_ids)} sub-goals, working on them with {other_model}")
+
+    # Work on sub-goals recursively with the model that did the breakdown
+    all_succeeded = True
+    for i, sub_goal_id in enumerate(sub_goal_ids, 1):
+        logging.info(f"{indent}[V2] Sub-goal {i}/{len(sub_goal_ids)}")
+
+        success = work_on_goal_v2_recursive(
+            db,
+            session_id=session_id,
+            goal_id=sub_goal_id,
+            repo_path=repo_path,
+            model_a=model_a,
+            model_b=model_b,
+            current_model=other_model,  # Model that broke down continues with sub-goals
+            max_decompositions=max_decompositions,
+            decomposition_count=decomposition_count + 1,
+            depth=depth + 1,
+            max_depth=max_depth
+        )
+
+        if not success:
+            all_succeeded = False
+            logging.warning(f"{indent}[V2] Sub-goal {sub_goal_id} failed")
+
+    if all_succeeded:
+        logging.info(f"{indent}[V2] ✓ All sub-goals succeeded for goal {goal_id}")
+    else:
+        logging.warning(f"{indent}[V2] ✗ Some sub-goals failed for goal {goal_id}")
+
+    return all_succeeded
+
+
 # ============================================================================
 # Database Helper Functions
 # ============================================================================
