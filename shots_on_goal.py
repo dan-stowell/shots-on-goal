@@ -16,8 +16,65 @@ from pathlib import Path
 import json
 import logging
 import time
+import threading
+import queue
 import llm
 from llm.utils import extract_fenced_code_block
+
+
+# ============================================================================
+# Timeout Utilities
+# ============================================================================
+
+class LLMTimeoutError(Exception):
+    """Raised when an LLM call exceeds the timeout."""
+    pass
+
+
+def run_with_timeout(func, timeout_seconds, *args, **kwargs):
+    """
+    Run a function with a timeout.
+
+    Args:
+        func: The function to run
+        timeout_seconds: Maximum time to wait in seconds
+        *args, **kwargs: Arguments to pass to the function
+
+    Returns:
+        The function's return value
+
+    Raises:
+        LLMTimeoutError: If the function doesn't complete within timeout
+    """
+    result_queue = queue.Queue()
+    exception_queue = queue.Queue()
+
+    def wrapper():
+        try:
+            result = func(*args, **kwargs)
+            result_queue.put(result)
+        except Exception as e:
+            exception_queue.put(e)
+
+    thread = threading.Thread(target=wrapper)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+
+    if thread.is_alive():
+        # Timeout occurred
+        raise LLMTimeoutError(f"LLM call exceeded timeout of {timeout_seconds} seconds")
+
+    # Check if an exception occurred
+    if not exception_queue.empty():
+        raise exception_queue.get()
+
+    # Return the result
+    if not result_queue.empty():
+        return result_queue.get()
+
+    # This shouldn't happen, but handle it gracefully
+    raise LLMTimeoutError("LLM call completed but no result was returned")
 
 
 # ============================================================================
@@ -1365,8 +1422,12 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             after_call=after_call
         )
 
-        # Get the response text
-        response_text = chain.text()
+        # Get the response text with 2-minute timeout
+        try:
+            response_text = run_with_timeout(chain.text, timeout_seconds=120)
+        except LLMTimeoutError as e:
+            logging.error(f"[Attempt {attempt_id}] LLM call timed out after 2 minutes")
+            raise
 
         logging.info(f"[Attempt {attempt_id}] LLM agent completed - {len(actions)} tools used")
         logging.debug(f"[Attempt {attempt_id}] Response: {response_text[:200]}...")
@@ -1520,6 +1581,31 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             'attempt_branch': branch_name if 'branch_name' in locals() else None
         }
 
+    except LLMTimeoutError as e:
+        # LLM call timed out - report this specific outcome
+        logging.warning(f"[Attempt {attempt_id}] LLM timeout: {e}")
+
+        # Commit changes even on timeout
+        if 'worktree_path' in locals():
+            final_commit_sha = git_manager.commit_worktree_changes(
+                worktree_path,
+                f"Attempt {attempt_id}: llm_timeout\n\nGoal: {goal_description}"
+            )
+            if final_commit_sha:
+                logging.info(f"[Attempt {attempt_id}] Committed changes: {final_commit_sha[:8]}")
+                update_attempt_metadata(db, attempt_id, final_commit_sha=final_commit_sha)
+
+        update_attempt_outcome(db, attempt_id, "llm_timeout", str(e))
+
+        return {
+            'success': False,
+            'attempt_id': attempt_id,
+            'actions': actions,
+            'outcome': "llm_timeout",
+            'error': str(e),
+            'attempt_branch': branch_name if 'branch_name' in locals() else None
+        }
+
     except Exception as e:
         # If something went wrong, record as error
         logging.error(f"[Attempt {attempt_id}] Error: {e}")
@@ -1642,10 +1728,25 @@ Return ONLY valid JSON (you can wrap in ```json if you want):
   }}
 ]"""
 
-    # Get LLM to decompose
+    # Get LLM to decompose with timeout
     model = llm.get_model(model_id)
     response = model.prompt(decomposition_prompt)
-    response_text = response.text().strip()
+    try:
+        response_text = run_with_timeout(lambda: response.text().strip(), timeout_seconds=120)
+    except LLMTimeoutError as e:
+        logging.error(f"[Goal {goal_id}] Decomposition LLM call timed out after 2 minutes")
+        # Return a single retry goal as fallback
+        validation_json = goal['validation_commands'] if goal['validation_commands'] else None
+        sub_goal_id = create_goal(
+            db=db,
+            description=f"Retry: {goal_description}",
+            parent_id=goal_id,
+            goal_type='implementation',
+            created_by_goal_id=goal_id,
+            validation_commands=validation_json
+        )
+        logging.info(f"  Created retry sub-goal (ID: {sub_goal_id}) after decomposition timeout")
+        return [sub_goal_id]
 
     logging.debug(f"[Goal {goal_id}] Decomposition response: {response_text}")
 
