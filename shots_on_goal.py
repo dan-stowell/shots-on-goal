@@ -16,8 +16,6 @@ from pathlib import Path
 import json
 import logging
 import time
-import threading
-import queue
 import llm
 from llm.utils import extract_fenced_code_block
 
@@ -115,52 +113,6 @@ class LLMTimeoutError(Exception):
     pass
 
 
-def run_with_timeout(func, timeout_seconds, *args, **kwargs):
-    """
-    Run a function with a timeout.
-
-    Args:
-        func: The function to run
-        timeout_seconds: Maximum time to wait in seconds
-        *args, **kwargs: Arguments to pass to the function
-
-    Returns:
-        The function's return value
-
-    Raises:
-        LLMTimeoutError: If the function doesn't complete within timeout
-    """
-    result_queue = queue.Queue()
-    exception_queue = queue.Queue()
-
-    def wrapper():
-        try:
-            result = func(*args, **kwargs)
-            result_queue.put(result)
-        except Exception as e:
-            exception_queue.put(e)
-
-    thread = threading.Thread(target=wrapper)
-    thread.daemon = True
-    thread.start()
-    thread.join(timeout=timeout_seconds)
-
-    if thread.is_alive():
-        # Timeout occurred
-        raise LLMTimeoutError(f"LLM call exceeded timeout of {timeout_seconds} seconds")
-
-    # Check if an exception occurred
-    if not exception_queue.empty():
-        raise exception_queue.get()
-
-    # Return the result
-    if not result_queue.empty():
-        return result_queue.get()
-
-    # This shouldn't happen, but handle it gracefully
-    raise LLMTimeoutError("LLM call completed but no result was returned")
-
-
 # ============================================================================
 # Database Setup
 # ============================================================================
@@ -170,7 +122,7 @@ def init_database(db_path):
     Initialize SQLite database with schema.
     Returns connection object.
     """
-    db = sqlite3.connect(db_path, check_same_thread=False)
+    db = sqlite3.connect(db_path)
     db.row_factory = sqlite3.Row  # Access columns by name
 
     # Enable foreign key constraints
@@ -1374,6 +1326,7 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
     actions = []
     pending_actions_for_db = []
     actions_flushed = False
+    last_activity_time = [time.time()]  # Use list for mutability in closure
 
     def flush_pending_actions():
         nonlocal actions_flushed
@@ -1435,6 +1388,15 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         # Set up after_call hook to record tool calls
         def after_call(tool, tool_call, tool_result):
             """Record each tool call in the database"""
+            # Check for timeout (no activity for 2 minutes)
+            elapsed = time.time() - last_activity_time[0]
+            if elapsed > 120:
+                logging.error(f"[Attempt {attempt_id}] Timeout: No activity for {elapsed:.1f} seconds")
+                raise LLMTimeoutError(f"No API activity for {elapsed:.1f} seconds (timeout: 120s)")
+
+            # Update activity timestamp
+            last_activity_time[0] = time.time()
+
             # Get tool name safely - handles both llm.Tool instances and plain functions
             tool_name = getattr(tool, "name", getattr(tool, "__name__", "unknown"))
 
@@ -1522,12 +1484,8 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             after_call=after_call
         )
 
-        # Get the response text with 2-minute timeout
-        try:
-            response_text = run_with_timeout(chain.text, timeout_seconds=120)
-        except LLMTimeoutError as e:
-            logging.error(f"[Attempt {attempt_id}] LLM call timed out after 2 minutes")
-            raise
+        # Get the response text (timeout is checked in after_call)
+        response_text = chain.text()
 
         logging.info(f"[Attempt {attempt_id}] LLM agent completed - {len(actions)} tools used")
         logging.debug(f"[Attempt {attempt_id}] Response: {response_text[:200]}...")
@@ -1834,25 +1792,18 @@ Return ONLY valid JSON (you can wrap in ```json if you want):
   }}
 ]"""
 
-    # Get LLM to decompose with timeout
+    # Get LLM to decompose
     model = llm.get_model(model_id)
-    response = model.prompt(decomposition_prompt)
+    logging.debug(f"[Goal {goal_id}] Requesting decomposition from {model_id}")
+
     try:
-        response_text = run_with_timeout(lambda: response.text().strip(), timeout_seconds=120)
-    except LLMTimeoutError as e:
-        logging.error(f"[Goal {goal_id}] Decomposition LLM call timed out after 2 minutes")
-        # Return a single retry goal as fallback
-        validation_json = goal['validation_commands'] if goal['validation_commands'] else None
-        sub_goal_id = create_goal(
-            db=db,
-            description=f"Retry: {goal_description}",
-            parent_id=goal_id,
-            goal_type='implementation',
-            created_by_goal_id=goal_id,
-            validation_commands=validation_json
-        )
-        logging.info(f"  Created retry sub-goal (ID: {sub_goal_id}) after decomposition timeout")
-        return [sub_goal_id]
+        response = model.prompt(decomposition_prompt)
+        response_text = response.text().strip()
+    except Exception as e:
+        logging.error(f"[Goal {goal_id}] Decomposition failed: {e}")
+        # Mark goal as failed instead of creating retry loop
+        update_goal_status(db, goal_id, 'failed')
+        return []
 
     logging.debug(f"[Goal {goal_id}] Decomposition response: {response_text}")
 
@@ -2138,7 +2089,7 @@ def load_session(session_path):
         logging.error(f"Database not found: {db_path}")
         sys.exit(1)
 
-    db = sqlite3.connect(str(db_path), check_same_thread=False)
+    db = sqlite3.connect(str(db_path))
     db.row_factory = sqlite3.Row
 
     # Enable foreign key constraints
@@ -2166,7 +2117,7 @@ def list_sessions():
         if not db_path.exists():
             continue
 
-        db = sqlite3.connect(str(db_path), check_same_thread=False)
+        db = sqlite3.connect(str(db_path))
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys = ON")
 
