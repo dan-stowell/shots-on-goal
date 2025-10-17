@@ -1436,47 +1436,83 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
 
     logging.info(f"[V2] Working on goal {goal_id}: {goal['goal_text'][:60]}")
 
-    # Get current commit SHA
-    result = subprocess.run(
-        ['git', 'rev-parse', 'HEAD'],
+    # Get or create persistent goal branch: s{session}-g{goal}
+    goal_branch_name = f"s{session_id}-g{goal_id}"
+
+    # Check if goal branch exists in git
+    check_branch = subprocess.run(
+        ['git', 'rev-parse', '--verify', goal_branch_name],
         cwd=repo_path,
         capture_output=True,
-        text=True,
-        check=True
+        text=True
     )
-    current_sha = result.stdout.strip()
+
+    if check_branch.returncode == 0:
+        # Goal branch exists - use its current HEAD
+        logging.info(f"[V2] Using existing goal branch: {goal_branch_name}")
+        goal_branch_sha = check_branch.stdout.strip()
+    else:
+        # Create new goal branch from session base branch
+        base_branch = session['base_branch']
+        result = subprocess.run(
+            ['git', 'rev-parse', base_branch],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        base_sha = result.stdout.strip()
+
+        subprocess.run(
+            ['git', 'branch', goal_branch_name, base_sha],
+            cwd=repo_path,
+            check=True,
+            capture_output=True
+        )
+        logging.info(f"[V2] Created new goal branch: {goal_branch_name} from {base_branch}")
+        goal_branch_sha = base_sha
+
+        # Track goal branch in database
+        create_branch_v2(
+            db,
+            session_id=session_id,
+            name=goal_branch_name,
+            parent_commit_sha=base_sha,
+            reason=f"Persistent branch for goal {goal_id}",
+            created_by_goal_id=goal_id
+        )
 
     # Get next attempt ID for unique paths
     cursor = db.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM attempt")
     next_attempt_id = cursor.fetchone()[0]
 
-    # Create unique branch name (never reused - includes timestamp)
+    # Create unique attempt branch name (includes timestamp)
     timestamp = int(time.time())
-    branch_name = f"s{session_id}-g{goal_id}-a{next_attempt_id}-{timestamp}"
+    attempt_branch_name = f"s{session_id}-g{goal_id}-a{next_attempt_id}-{timestamp}"
 
-    # Create branch (always create new, never reuse)
-    branch_id = create_branch_v2(
+    # Create attempt branch from goal branch
+    attempt_branch_id = create_branch_v2(
         db,
         session_id=session_id,
-        name=branch_name,
-        parent_commit_sha=current_sha,
-        reason=f"Goal {goal_id}",
+        name=attempt_branch_name,
+        parent_commit_sha=goal_branch_sha,
+        reason=f"Attempt for goal {goal_id}",
         created_by_goal_id=goal_id
     )
-    logging.info(f"[V2] Created branch: {branch_name}")
+    logging.info(f"[V2] Created attempt branch: {attempt_branch_name} from {goal_branch_name}")
 
     # Create worktree path (globally unique: session + goal + attempt + timestamp)
     worktree_path = f"{repo_path}/worktrees/s{session_id}-g{goal_id}-a{next_attempt_id}-{timestamp}"
 
-    # Create git worktree with new branch
+    # Create git worktree with attempt branch
     os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
     subprocess.run(
-        ['git', 'worktree', 'add', '-b', branch_name, worktree_path, current_sha],
+        ['git', 'worktree', 'add', '-b', attempt_branch_name, worktree_path, goal_branch_sha],
         cwd=repo_path,
         check=True,
         capture_output=True
     )
-    logging.info(f"[V2] Created git worktree: {worktree_path} (branch: {branch_name})")
+    logging.info(f"[V2] Created git worktree: {worktree_path} (branch: {attempt_branch_name})")
 
     # Configure git for commits (defensive - may already be set)
     subprocess.run(
@@ -1493,9 +1529,9 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
     # Track worktree in database
     worktree_id = create_worktree_v2(
         db,
-        branch_id=branch_id,
+        branch_id=attempt_branch_id,
         path=worktree_path,
-        start_sha=current_sha,
+        start_sha=goal_branch_sha,
         reason=f"Attempt for goal {goal_id}"
     )
 
@@ -1505,7 +1541,7 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
         db,
         goal_id=goal_id,
         worktree_id=worktree_id,
-        start_commit_sha=current_sha,
+        start_commit_sha=goal_branch_sha,
         prompt=prompt,
         model=model_id,
         attempt_type=attempt_type
@@ -1655,7 +1691,7 @@ Prompt sent to LLM:
 
             # Get diff between start and end
             diff_result = subprocess.run(
-                ['git', 'diff', current_sha, end_sha],
+                ['git', 'diff', goal_branch_sha, end_sha],
                 cwd=worktree_path,
                 capture_output=True,
                 text=True
@@ -1667,19 +1703,19 @@ Prompt sent to LLM:
 
         except LLMTimeoutError as e:
             logging.error(f"[V2] Timeout: {e}")
-            end_sha = current_sha
+            end_sha = goal_branch_sha
             diff = ""
             status = "timeout"
             status_detail = str(e)
         except ToolLimitExceeded as e:
             logging.error(f"[V2] Tool limit exceeded: {e}")
-            end_sha = current_sha
+            end_sha = goal_branch_sha
             diff = ""
             status = "tool_limit"
             status_detail = str(e)
         except Exception as e:
             logging.error(f"[V2] Error: {e}")
-            end_sha = current_sha
+            end_sha = goal_branch_sha
             diff = ""
             status = "error"
             status_detail = str(e)
@@ -1693,24 +1729,35 @@ Prompt sent to LLM:
     )
     logging.info(f"[V2] Created attempt result {result_id}: {status}")
 
-    # Run validation if goal has validation steps
+    # Run validation if goal has validation steps (use container for consistency)
     validation_steps = get_validation_steps_v2(db, goal_id)
     validation_passed = None
 
     if validation_steps:
-        logging.info(f"[V2] Running {len(validation_steps)} validation steps")
+        logging.info(f"[V2] Running {len(validation_steps)} validation steps in container")
         all_passed = True
 
-        for step in validation_steps:
-            # Execute validation command
-            val_result = subprocess.run(
-                step['command'],
-                cwd=worktree_path,
-                shell=True,
+        # Restart container for validation (it may have been stopped)
+        container_restarted = False
+        try:
+            # Check if container is still running
+            check_result = subprocess.run(
+                [runtime if runtime else 'container', 'inspect', '-f', '{{.State.Running}}', container_id],
                 capture_output=True,
-                text=True,
-                timeout=300
+                text=True
             )
+            if check_result.returncode != 0 or check_result.stdout.strip() != 'true':
+                container_id = container.start(worktree_path)
+                container_restarted = True
+                logging.info(f"[V2] Restarted container for validation")
+        except:
+            container_id = container.start(worktree_path)
+            container_restarted = True
+            logging.info(f"[V2] Started new container for validation")
+
+        for step in validation_steps:
+            # Execute validation command in container
+            val_result = container.exec(step['command'], timeout=300)
 
             create_validation_run_v2(
                 db,
@@ -1726,17 +1773,101 @@ Prompt sent to LLM:
             else:
                 logging.info(f"[V2]   Validation passed: {step['command']}")
 
+        if container_restarted:
+            container.stop()
+
         validation_passed = all_passed
         logging.info(f"[V2] Validation: {'PASSED' if validation_passed else 'FAILED'}")
 
-    success = (status == "success" or status == "completed") and (validation_passed is not False)
+        # Update status to "success" if validation passed
+        if validation_passed and status == "completed":
+            status = "success"
+            # Update the attempt_result in the database
+            db.execute(
+                "UPDATE attempt_result SET status = ? WHERE id = ?",
+                (status, result_id)
+            )
+            db.commit()
+            logging.info(f"[V2] Updated result status to 'success'")
+
+    # Merge attempt branch into goal branch on success
+    if status == "success" and validation_passed:
+        try:
+            logging.info(f"[V2] Merging {attempt_branch_name} into {goal_branch_name}")
+
+            # Checkout goal branch in main repo
+            subprocess.run(
+                ['git', 'checkout', goal_branch_name],
+                cwd=repo_path,
+                check=True,
+                capture_output=True
+            )
+
+            # Merge attempt branch with --no-ff to preserve history
+            subprocess.run(
+                ['git', 'merge', '--no-ff', '-m', f'Merge attempt {attempt_id} for goal {goal_id}', attempt_branch_name],
+                cwd=repo_path,
+                check=True,
+                capture_output=True
+            )
+
+            # Get merge commit SHA
+            merge_result = subprocess.run(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            merge_commit_sha = merge_result.stdout.strip()
+            logging.info(f"[V2] ✓ Merged successfully (commit: {merge_commit_sha[:8]})")
+
+            # Record merge in database
+            # Get branch IDs
+            goal_branch_result = db.execute(
+                "SELECT id FROM branch WHERE name = ? AND session_id = ?",
+                (goal_branch_name, session_id)
+            ).fetchone()
+
+            if goal_branch_result:
+                goal_branch_id = goal_branch_result[0]
+                create_merge_v2(
+                    db,
+                    from_branch_id=attempt_branch_id,
+                    from_commit_sha=end_sha,
+                    to_branch_id=goal_branch_id,
+                    to_commit_sha=goal_branch_sha,
+                    result_commit_sha=merge_commit_sha
+                )
+                logging.info(f"[V2] Recorded merge in database")
+
+        except subprocess.CalledProcessError as e:
+            logging.error(f"[V2] Failed to merge: {e}")
+            status = "error"
+            # Don't fail the entire attempt, just log the error
+
+    # Cleanup: remove worktree
+    try:
+        logging.info(f"[V2] Cleaning up worktree: {worktree_path}")
+        subprocess.run(
+            ['git', 'worktree', 'remove', worktree_path, '--force'],
+            cwd=repo_path,
+            check=True,
+            capture_output=True
+        )
+        logging.info(f"[V2] ✓ Worktree removed")
+    except subprocess.CalledProcessError as e:
+        logging.warning(f"[V2] Failed to remove worktree: {e}")
+
+    success = (status == "success") and (validation_passed is True)
 
     return {
         'success': success,
         'attempt_id': attempt_id,
         'result_id': result_id,
         'validation_passed': validation_passed,
-        'worktree_path': worktree_path
+        'worktree_path': worktree_path,
+        'goal_branch': goal_branch_name
     }
 
 
