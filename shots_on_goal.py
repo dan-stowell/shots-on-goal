@@ -1402,8 +1402,8 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
     )
     current_sha = result.stdout.strip()
 
-    # Create or get branch for this goal
-    branch_name = f"goal-{goal_id}-v2"
+    # Create or get branch for this goal (include session_id for global uniqueness)
+    branch_name = f"s{session_id}-goal-{goal_id}"
     existing_branch = get_branch_by_name_v2(db, session_id, branch_name)
 
     if existing_branch:
@@ -1420,18 +1420,41 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
         )
         logging.info(f"[V2] Created branch: {branch_name}")
 
-    # Create worktree path
-    worktree_path = f"{repo_path}/worktrees/goal-{goal_id}-attempt-{int(time.time())}"
+    # Get next attempt ID for unique worktree path
+    cursor = db.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM attempt")
+    next_attempt_id = cursor.fetchone()[0]
 
-    # Actually create git worktree
+    # Create worktree path (globally unique: session + goal + attempt)
+    worktree_path = f"{repo_path}/worktrees/s{session_id}-g{goal_id}-a{next_attempt_id}"
+
+    # Create git worktree with branch
     os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
-    subprocess.run(
-        ['git', 'worktree', 'add', worktree_path, current_sha],
+
+    # Check if branch exists in git
+    branch_check = subprocess.run(
+        ['git', 'rev-parse', '--verify', branch_name],
         cwd=repo_path,
-        check=True,
         capture_output=True
     )
-    logging.info(f"[V2] Created git worktree: {worktree_path}")
+
+    if branch_check.returncode == 0:
+        # Branch exists, checkout in worktree
+        subprocess.run(
+            ['git', 'worktree', 'add', worktree_path, branch_name],
+            cwd=repo_path,
+            check=True,
+            capture_output=True
+        )
+    else:
+        # Branch doesn't exist, create it
+        subprocess.run(
+            ['git', 'worktree', 'add', '-b', branch_name, worktree_path, current_sha],
+            cwd=repo_path,
+            check=True,
+            capture_output=True
+        )
+
+    logging.info(f"[V2] Created git worktree: {worktree_path} (branch: {branch_name})")
 
     # Track worktree in database
     worktree_id = create_worktree_v2(
@@ -1682,8 +1705,12 @@ def breakdown_goal_v2(db, session_id, goal_id, failed_attempt_id, model_id, repo
                           text=True, check=True)
     current_sha = result.stdout.strip()
 
-    # Create branch for breakdown
-    branch_name = f"goal-{goal_id}-breakdown"
+    # Get next attempt ID for unique paths
+    cursor = db.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM attempt")
+    next_attempt_id = cursor.fetchone()[0]
+
+    # Create branch for breakdown (globally unique)
+    branch_name = f"s{session_id}-goal-{goal_id}-breakdown"
     existing_branch = get_branch_by_name_v2(db, session_id, branch_name)
     if existing_branch:
         branch_id = existing_branch['id']
@@ -1696,8 +1723,39 @@ def breakdown_goal_v2(db, session_id, goal_id, failed_attempt_id, model_id, repo
             created_by_goal_id=goal_id
         )
 
-    # Create worktree for breakdown
-    worktree_path = f"{repo_path}/worktrees/goal-{goal_id}-breakdown"
+    # Create worktree path (globally unique)
+    worktree_path = f"{repo_path}/worktrees/s{session_id}-g{goal_id}-a{next_attempt_id}-breakdown"
+
+    # Actually create git worktree
+    os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
+
+    # Check if branch exists in git
+    branch_check = subprocess.run(
+        ['git', 'rev-parse', '--verify', branch_name],
+        cwd=repo_path,
+        capture_output=True
+    )
+
+    if branch_check.returncode == 0:
+        # Branch exists, checkout in worktree
+        subprocess.run(
+            ['git', 'worktree', 'add', worktree_path, branch_name],
+            cwd=repo_path,
+            check=True,
+            capture_output=True
+        )
+    else:
+        # Branch doesn't exist, create it
+        subprocess.run(
+            ['git', 'worktree', 'add', '-b', branch_name, worktree_path, current_sha],
+            cwd=repo_path,
+            check=True,
+            capture_output=True
+        )
+
+    logging.info(f"[V2 Breakdown] Created git worktree: {worktree_path} (branch: {branch_name})")
+
+    # Track worktree in database
     worktree_id = create_worktree_v2(
         db, branch_id, worktree_path, current_sha,
         reason=f"Breakdown attempt for goal {goal_id}"
