@@ -1062,6 +1062,27 @@ class WorktreeToolExecutor:
         except Exception as e:
             return {'success': False, 'content': None, 'error': str(e)}
 
+    def read_multiple_files(self, paths):
+        """
+        Read multiple files from the worktree at once.
+
+        Args:
+            paths: List of file paths relative to worktree root
+
+        Returns:
+            dict mapping path to result dict with 'success', 'content', 'error'
+        """
+        results = {}
+        for path in paths:
+            try:
+                full_path = os.path.join(self.worktree_path, path)
+                with open(full_path, 'r') as f:
+                    content = f.read()
+                results[path] = {'success': True, 'content': content, 'error': None}
+            except Exception as e:
+                results[path] = {'success': False, 'content': None, 'error': str(e)}
+        return results
+
     def write_file(self, path, content):
         """Write content to a file in the worktree."""
         try:
@@ -1173,6 +1194,25 @@ def create_v2_tool_functions(tools_executor):
             return result['content']
         else:
             return f"ERROR: {result['error']}"
+
+    def read_multiple_files(paths: list) -> str:
+        """
+        Read multiple files at once (more efficient than calling read_file multiple times).
+
+        Args:
+            paths: List of file paths relative to workspace root
+
+        Returns:
+            Formatted string with contents of each file, separated by headers
+        """
+        results = tools_executor.read_multiple_files(paths)
+        output = []
+        for path, result in results.items():
+            if result['success']:
+                output.append(f"=== {path} ===\n{result['content']}")
+            else:
+                output.append(f"=== {path} ===\nERROR: {result['error']}")
+        return "\n\n".join(output) if output else "No files read"
 
     def write_file(path: str, content: str) -> str:
         """
@@ -1336,6 +1376,7 @@ def create_v2_tool_functions(tools_executor):
 
     return [
         read_file,
+        read_multiple_files,
         write_file,
         find_replace_in_file,
         list_directory,
@@ -4057,6 +4098,7 @@ def main():
         # Create tools in V2 schema
         tool_definitions = [
             ('read_file', 'Read a file from the workspace'),
+            ('read_multiple_files', 'Read multiple files at once (more efficient than calling read_file multiple times)'),
             ('write_file', 'Write content to a file'),
             ('find_replace_in_file', 'Find and replace text in a file'),
             ('list_directory', 'List files in a directory'),
