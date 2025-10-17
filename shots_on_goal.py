@@ -23,6 +23,90 @@ from llm.utils import extract_fenced_code_block
 
 
 # ============================================================================
+# Git Utilities
+# ============================================================================
+
+def detect_default_branch(repo_path):
+    """
+    Detect the default branch of a git repository.
+
+    Tries multiple methods:
+    1. Check current branch
+    2. Check remote HEAD (origin/HEAD)
+    3. Fall back to common names (main, master)
+
+    Args:
+        repo_path: Path to the git repository
+
+    Returns:
+        The name of the default branch (e.g., 'main', 'master')
+
+    Raises:
+        ValueError: If no suitable branch can be detected
+    """
+    # Try method 1: Get the current branch
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        branch = result.stdout.strip()
+        if branch and branch != 'HEAD':
+            logging.debug(f"Detected current branch: {branch}")
+            return branch
+    except subprocess.CalledProcessError:
+        pass
+
+    # Try method 2: Check remote HEAD (origin/HEAD -> origin/main)
+    try:
+        result = subprocess.run(
+            ['git', 'symbolic-ref', 'refs/remotes/origin/HEAD'],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        # Output is like "refs/remotes/origin/main"
+        remote_head = result.stdout.strip()
+        if remote_head.startswith('refs/remotes/origin/'):
+            branch = remote_head.replace('refs/remotes/origin/', '')
+            logging.debug(f"Detected default branch from origin/HEAD: {branch}")
+            return branch
+    except subprocess.CalledProcessError:
+        pass
+
+    # Try method 3: Check for common branch names
+    try:
+        result = subprocess.run(
+            ['git', 'branch', '--list'],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        branches = [line.strip().lstrip('* ') for line in result.stdout.split('\n') if line.strip()]
+
+        # Prefer main, then master, then take the first one
+        for preferred in ['main', 'master']:
+            if preferred in branches:
+                logging.debug(f"Detected branch from common names: {preferred}")
+                return preferred
+
+        # If we have any branches, use the first
+        if branches:
+            logging.debug(f"Using first available branch: {branches[0]}")
+            return branches[0]
+    except subprocess.CalledProcessError:
+        pass
+
+    # If all methods fail, raise an error
+    raise ValueError(f"Could not detect default branch in repository: {repo_path}")
+
+
+# ============================================================================
 # Timeout Utilities
 # ============================================================================
 
@@ -2187,8 +2271,16 @@ def main():
         logging.error(f"Not a git repository: {repo_path}")
         sys.exit(1)
 
+    # Detect default branch
+    try:
+        base_branch = detect_default_branch(str(repo_path))
+        logging.info(f"Detected base branch: {base_branch}")
+    except ValueError as e:
+        logging.error(str(e))
+        sys.exit(1)
+
     # Create new session
-    session_dir, db = create_session(args.goal, str(repo_path))
+    session_dir, db = create_session(args.goal, str(repo_path), base_branch)
     logging.info(f"Created session: {session_dir.name}")
 
     # Create root goal
