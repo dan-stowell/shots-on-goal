@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 import json
 import logging
+import time
 import llm
 from llm.utils import extract_fenced_code_block
 
@@ -79,6 +80,7 @@ def init_database(db_path):
         CREATE TABLE IF NOT EXISTS attempts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             goal_id INTEGER NOT NULL,
+            model_id TEXT,
             started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP,
             outcome TEXT,
@@ -92,11 +94,13 @@ def init_database(db_path):
         )
     """)
 
-    # Add final_commit_sha column if it doesn't exist (for existing databases)
+    # Add columns if they don't exist (for existing databases)
     cursor.execute("PRAGMA table_info(attempts)")
     columns = [row[1] for row in cursor.fetchall()]
     if 'final_commit_sha' not in columns:
         cursor.execute("ALTER TABLE attempts ADD COLUMN final_commit_sha TEXT")
+    if 'model_id' not in columns:
+        cursor.execute("ALTER TABLE attempts ADD COLUMN model_id TEXT")
 
     # Actions table (tool calls during attempts)
     cursor.execute("""
@@ -214,16 +218,16 @@ def update_goal_status(db, goal_id, status, git_branch=None):
     db.commit()
 
 
-def create_attempt(db, goal_id, git_branch=None, worktree_path=None,
+def create_attempt(db, goal_id, model_id=None, git_branch=None, worktree_path=None,
                    container_id=None, git_commit_sha=None):
     """Create a new attempt for a goal and return its ID."""
     cursor = db.execute(
         """
         INSERT INTO attempts
-        (goal_id, git_branch, worktree_path, container_id, git_commit_sha)
-        VALUES (?, ?, ?, ?, ?)
+        (goal_id, model_id, git_branch, worktree_path, container_id, git_commit_sha)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (goal_id, git_branch, worktree_path, container_id, git_commit_sha)
+        (goal_id, model_id, git_branch, worktree_path, container_id, git_commit_sha)
     )
     db.commit()
     return cursor.lastrowid
@@ -306,6 +310,42 @@ def get_actions(db, attempt_id):
 
 
 # ============================================================================
+# Model Utilities
+# ============================================================================
+
+def shorten_model_name(model_id):
+    """
+    Shorten model ID for use in branch names.
+
+    Examples:
+        'openrouter/anthropic/claude-haiku-4.5' -> 'haiku45'
+        'openrouter/x-ai/grok-code-fast-1' -> 'grok-code-fast-1'
+        'openrouter/google/gemini-2.5-flash' -> 'gemini25-flash'
+    """
+    # Remove 'openrouter/' prefix if present
+    name = model_id.replace('openrouter/', '')
+
+    # Common simplifications
+    name = name.replace('anthropic/', '')
+    name = name.replace('x-ai/', '')
+    name = name.replace('google/', '')
+    name = name.replace('openai/', '')
+    name = name.replace('z-ai/', '')
+    name = name.replace('qwen/', '')
+    name = name.replace('claude-', '')
+
+    # Remove dots and simplify version numbers
+    name = name.replace('.', '')
+    name = name.replace('_', '-')
+
+    # Truncate if too long (git branch names should be reasonable)
+    if len(name) > 20:
+        name = name[:20]
+
+    return name
+
+
+# ============================================================================
 # Git Management
 # ============================================================================
 
@@ -357,14 +397,18 @@ class GitManager:
 
         return branch_name
 
-    def create_worktree_for_attempt(self, goal_id, attempt_id, base_branch, session_id=None):
+    def create_worktree_for_attempt(self, goal_id, attempt_id, base_branch, session_id=None, model_id=None):
         """
         Create a worktree with a new branch for an attempt.
         Returns: (worktree_path, branch_name, commit_sha)
         """
-        # Include session_id for uniqueness across runs
+        # Include session_id and model for uniqueness across runs
         if session_id:
-            branch_name = f"s{session_id}-g{goal_id}-a{attempt_id}"
+            if model_id:
+                model_short = shorten_model_name(model_id)
+                branch_name = f"s{session_id}-g{goal_id}-a{attempt_id}-m{model_short}"
+            else:
+                branch_name = f"s{session_id}-g{goal_id}-a{attempt_id}"
         else:
             branch_name = f"goal-{goal_id}-attempt-{attempt_id}"
 
@@ -1147,8 +1191,8 @@ class ToolLimitExceeded(Exception):
 
 
 def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="container",
-                 model_id="openrouter/anthropic/claude-haiku-4.5", system_prompt=None, max_tools=20,
-                 goal_working_branch=None):
+                 model_id="openrouter/anthropic/claude-haiku-4.5", system_prompt=None, max_tools=50,
+                 goal_working_branch=None, previous_attempts=None, merge_target_branch=None):
     """
     Work on a goal using an LLM agent with tool access.
 
@@ -1160,8 +1204,10 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         runtime: Container runtime ('container' or 'docker')
         model_id: LLM model to use (default: openrouter/anthropic/claude-haiku-4.5)
         system_prompt: Optional system prompt for the LLM
-        max_tools: Maximum number of tool calls allowed (default: 20)
+        max_tools: Maximum number of tool calls allowed (default: 50)
         goal_working_branch: Branch to base the attempt on (if None, uses session base_branch)
+        previous_attempts: List of previous attempt results (for feedback loop)
+        merge_target_branch: Branch to merge into on success (if None, uses goal_working_branch)
 
     Returns:
         dict with 'success', 'attempt_id', 'actions', 'outcome', 'response_text', 'attempt_branch'
@@ -1181,7 +1227,7 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
     git_manager = GitManager(abs_repo_path)
 
     # Create attempt record first so we can derive branch/worktree names
-    attempt_id = create_attempt(db, goal_id=goal_id)
+    attempt_id = create_attempt(db, goal_id=goal_id, model_id=model_id)
 
     # Initialize variables for exception handling
     actions = []
@@ -1193,7 +1239,8 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
             goal_id,
             attempt_id=attempt_id,
             base_branch=base_branch,
-            session_id=session_id
+            session_id=session_id,
+            model_id=model_id
         )
 
         # Persist metadata we already know
@@ -1204,6 +1251,10 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
             worktree_path=worktree_path,
             git_commit_sha=commit_sha
         )
+
+        logging.info(f"[Attempt {attempt_id}] Model: {model_id}")
+        logging.info(f"[Attempt {attempt_id}] Branch: {branch_name}")
+        logging.info(f"[Attempt {attempt_id}] Worktree: {worktree_path}")
 
         container_id = container.start(worktree_path)
 
@@ -1220,7 +1271,7 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         goal = get_goal(db, goal_id)
         goal_description = goal['description']
 
-        logging.info(f"[Attempt {attempt_id}] Working on goal: {goal_description}")
+        logging.info(f"[Attempt {attempt_id}] [{model_id}] Working on goal: {goal_description}")
 
         # Set up after_call hook to record tool calls
         def after_call(tool, tool_call, tool_result):
@@ -1272,6 +1323,38 @@ Your task is to work towards achieving the goal. You should:
 4. Be methodical and explain your reasoning
 
 When you have successfully achieved the goal (or determined it cannot be achieved), explain your final status clearly."""
+
+            # Add feedback from previous attempts if any
+            if previous_attempts:
+                logging.info(f"[Attempt {attempt_id}] Including feedback from {len(previous_attempts)} previous attempt(s)")
+
+                feedback_section = "\n\n**IMPORTANT - Previous Attempts:**\n"
+                feedback_section += f"This goal has been attempted {len(previous_attempts)} time(s) before. Learn from these attempts:\n\n"
+
+                for i, prev in enumerate(previous_attempts, 1):
+                    outcome = prev['outcome']
+                    feedback_section += f"Attempt {i}: {outcome}\n"
+
+                    # Log summary of each previous attempt
+                    logging.info(f"[Attempt {attempt_id}]   Previous attempt {i}: {outcome}")
+
+                    # Include error details if available
+                    if 'error' in prev:
+                        error_msg = str(prev['error'])[:200]  # Truncate long errors
+                        feedback_section += f"  Error: {error_msg}\n"
+                        logging.info(f"[Attempt {attempt_id}]     Error: {error_msg[:100]}")
+
+                    # Include validation failures if available
+                    if outcome == 'error' and 'actions' in prev and len(prev['actions']) > 0:
+                        # The validation failure info would be in the final actions/result
+                        feedback_section += f"  ({len(prev['actions'])} tool calls were made)\n"
+
+                feedback_section += "\n**What to do differently:**\n"
+                feedback_section += "- Analyze what went wrong in previous attempts\n"
+                feedback_section += "- Try a different approach or fix the specific errors\n"
+                feedback_section += "- Pay attention to validation failures from previous attempts\n"
+
+                system_prompt += feedback_section
 
         # Execute LLM chain with tools
         logging.info(f"[Attempt {attempt_id}] Starting LLM agent with model {model_id}")
@@ -1379,16 +1462,20 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             f"Attempt {attempt_id}: {outcome}\n\nGoal: {goal_description}"
         )
         if final_commit_sha:
-            logging.info(f"[Attempt {attempt_id}] Committed changes: {final_commit_sha[:8]}")
+            logging.info(f"[Attempt {attempt_id}] Committed changes: {final_commit_sha[:8]} on branch {branch_name}")
+            logging.info(f"[Attempt {attempt_id}]   View changes: git show {final_commit_sha[:8]}")
+            logging.info(f"[Attempt {attempt_id}]   Worktree files: {worktree_path}")
             update_attempt_metadata(db, attempt_id, final_commit_sha=final_commit_sha)
         else:
             logging.info(f"[Attempt {attempt_id}] No changes to commit")
 
         # If successful, merge attempt branch into goal's working branch
-        if outcome == "success" and goal_working_branch:
-            logging.info(f"[Attempt {attempt_id}] Merging {branch_name} into {goal_working_branch}")
+        # Use merge_target_branch if specified, otherwise use goal_working_branch
+        target_branch = merge_target_branch if merge_target_branch else goal_working_branch
+        if outcome == "success" and target_branch:
+            logging.info(f"[Attempt {attempt_id}] Merging {branch_name} into {target_branch}")
             try:
-                git_manager.merge_branch(branch_name, goal_working_branch, no_ff=True)
+                git_manager.merge_branch(branch_name, target_branch, no_ff=True)
                 logging.info(f"[Attempt {attempt_id}] ✓ Merged successfully")
             except subprocess.CalledProcessError as e:
                 logging.error(f"[Attempt {attempt_id}] Failed to merge: {e}")
@@ -1471,14 +1558,14 @@ When you have successfully achieved the goal (or determined it cannot be achieve
 # Goal Decomposition
 # ============================================================================
 
-def decompose_goal(db, goal_id, attempt_result, model_id="openrouter/anthropic/claude-haiku-4.5"):
+def decompose_goal(db, goal_id, attempt_results, model_id="openrouter/anthropic/claude-haiku-4.5"):
     """
     Decompose a goal into sub-goals using LLM.
 
     Args:
         db: Database connection
         goal_id: Goal ID that needs decomposition
-        attempt_result: Result dict from work_on_goal()
+        attempt_results: List of result dicts from work_on_goal() attempts
         model_id: LLM model to use
 
     Returns:
@@ -1486,36 +1573,43 @@ def decompose_goal(db, goal_id, attempt_result, model_id="openrouter/anthropic/c
     """
     goal = get_goal(db, goal_id)
     goal_description = goal['description']
-    outcome = attempt_result['outcome']
-    actions = attempt_result['actions']
 
-    logging.info(f"[Goal {goal_id}] Decomposing goal after outcome: {outcome}")
+    logging.info(f"[Goal {goal_id}] Decomposing goal after {len(attempt_results)} attempts")
 
-    # Build context about what was attempted
-    tools_used = [action['tool'] for action in actions]
-    tool_summary = ", ".join(set(tools_used[:10]))  # First 10 unique tools
+    # Build context about all attempts
+    attempts_summary = []
+    for i, result in enumerate(attempt_results, 1):
+        outcome = result['outcome']
+        actions = result.get('actions', [])
+        tools_used = [action['tool'] for action in actions]
+        tool_summary = ", ".join(set(tools_used[:10]))  # First 10 unique tools
+
+        attempt_info = f"Attempt {i}: {outcome}"
+        if actions:
+            attempt_info += f" ({len(actions)} tool calls: {tool_summary})"
+        if 'error' in result:
+            error_msg = str(result['error'])[:150]
+            attempt_info += f" - Error: {error_msg}"
+
+        attempts_summary.append(attempt_info)
 
     # Prompt for decomposition
-    decomposition_prompt = f"""A goal attempt did not succeed. Analyze the situation and break down the goal into smaller, concrete sub-goals.
+    decomposition_prompt = f"""A goal could not be achieved after multiple attempts. Analyze the situation and break down the goal into smaller, concrete sub-goals.
 
 **Original Goal:**
 {goal_description}
 
-**Attempt Outcome:**
-{outcome}
-
-**What was tried:**
-- {len(actions)} tool calls were made
-- Tools used: {tool_summary}
-{f"- Error: {attempt_result.get('error', 'N/A')}" if outcome == 'error' else ''}
+**Attempts Made:**
+{chr(10).join(f'- {summary}' for summary in attempts_summary)}
 
 **Your task:**
-Break this goal down into 3-5 concrete, actionable sub-goals that:
-1. Are VERY SPECIFIC about what to create/modify (not exploratory or documentation tasks)
-2. Are smaller in scope (achievable in <20 tool calls each)
-3. Build toward achieving the original goal
-4. Build on each other sequentially (each sub-goal uses the results of previous ones)
-5. Have concrete validation commands that test functionality
+Analyze what went wrong in the attempts above and break this goal down into 3-5 concrete, actionable sub-goals that:
+1. AVOID the mistakes/errors from previous attempts
+2. Are VERY SPECIFIC about what to create/modify (not exploratory or documentation tasks)
+3. Are smaller in scope (achievable in <20 tool calls each)
+4. Build toward achieving the original goal
+5. Build on each other sequentially (each sub-goal uses the results of previous ones)
+6. Have concrete validation commands that test functionality
 
 **What makes a good sub-goal:**
 ✓ "Create MODULE.bazel with rules_python version 0.31.0"
@@ -1621,10 +1715,12 @@ Return ONLY valid JSON (you can wrap in ```json if you want):
 # Work Orchestration
 # ============================================================================
 
-def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, depth=0, max_depth=5,
-                          parent_working_branch=None):
+def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_a, model_b,
+                          max_tools=50, max_decompositions=5, depth=0, max_depth=5,
+                          parent_working_branch=None, current_model=None,
+                          decomposition_count=0):
     """
-    Work on a goal recursively: try once, decompose if needed, work on sub-goals.
+    Work on a goal recursively with ping-pong model alternation.
 
     Args:
         db: Database connection
@@ -1632,10 +1728,15 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
         repo_path: Path to repository
         image: Container image
         runtime: Container runtime
-        model_id: LLM model ID
+        model_a: First model ID
+        model_b: Second model ID
+        max_tools: Maximum tool calls per attempt
+        max_decompositions: Maximum number of decompositions before giving up
         depth: Current recursion depth
         max_depth: Maximum recursion depth
         parent_working_branch: Parent goal's working branch (None for root goal)
+        current_model: Which model should attempt this goal (None = start with A)
+        decomposition_count: How many decompositions have occurred so far
 
     Returns:
         bool: True if goal completed successfully
@@ -1645,6 +1746,12 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
     goal_desc = goal['description'][:80]
 
     logging.info(f"{indent}[Goal {goal_id}] Working on: {goal_desc}")
+
+    # Check decomposition limit
+    if decomposition_count >= max_decompositions:
+        logging.warning(f"{indent}[Goal {goal_id}] Max decompositions ({max_decompositions}) reached - marking as failed")
+        update_goal_status(db, goal_id, 'failed')
+        return False
 
     # Check depth limit
     if depth >= max_depth:
@@ -1694,80 +1801,89 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_id, dep
     if goal['status'] != 'in_progress':
         update_goal_status(db, goal_id, 'in_progress')
 
-    # Make one attempt
+    # Determine which model to use (default to A if not specified)
+    if current_model is None:
+        model_to_use = model_a
+        other_model = model_b
+    else:
+        model_to_use = current_model
+        other_model = model_b if current_model == model_a else model_a
+
+    logging.info(f"{indent}[Goal {goal_id}] {shorten_model_name(model_to_use)} attempting...")
+
+    # Single attempt with current model
+    start_time = time.time()
     result = work_on_goal(
         db=db,
         goal_id=goal_id,
         repo_path=repo_path,
         image=image,
         runtime=runtime,
-        model_id=model_id,
-        goal_working_branch=goal_working_branch
+        model_id=model_to_use,
+        max_tools=max_tools,
+        goal_working_branch=goal_working_branch,
+        merge_target_branch=goal_working_branch
     )
+    elapsed = time.time() - start_time
 
     # Handle the outcome
     if result['outcome'] == 'success':
-        logging.info(f"{indent}[Goal {goal_id}] ✓ Completed successfully")
+        logging.info(f"{indent}[Goal {goal_id}] ✓ {shorten_model_name(model_to_use)} succeeded in {elapsed:.1f}s!")
         update_goal_status(db, goal_id, 'completed')
         return True
-
     else:
-        # Not successful - check if we should decompose
-        # Only decompose root goals (goals without parents)
-        # Sub-goals that fail should not be decomposed further
-        if goal['parent_id'] is None:
-            # Root goal - decompose and work on sub-goals
-            logging.info(f"{indent}[Goal {goal_id}] Outcome: {result['outcome']} - decomposing...")
+        logging.info(f"{indent}[Goal {goal_id}] ✗ {shorten_model_name(model_to_use)} failed: {result['outcome']} (took {elapsed:.1f}s)")
 
-            sub_goal_ids = decompose_goal(db, goal_id, result, model_id=model_id)
+    # Failed - decompose with other model
+    logging.info(f"{indent}[Goal {goal_id}] Flipping to {shorten_model_name(other_model)} for decomposition...")
 
-            if not sub_goal_ids:
-                logging.warning(f"{indent}[Goal {goal_id}] No sub-goals created - marking as failed")
-                update_goal_status(db, goal_id, 'failed')
-                return False
+    sub_goal_ids = decompose_goal(db, goal_id, [result], model_id=other_model)
+
+    if not sub_goal_ids:
+        logging.warning(f"{indent}[Goal {goal_id}] No sub-goals created - marking as failed")
+        update_goal_status(db, goal_id, 'failed')
+        return False
+
+    # Work on each sub-goal sequentially with the decomposing model
+    # STOP on first failure (fail-fast)
+    all_succeeded = True
+
+    for i, sub_goal_id in enumerate(sub_goal_ids, 1):
+        logging.info(f"{indent}[Goal {goal_id}] Working on sub-goal {i}/{len(sub_goal_ids)}")
+
+        success = work_on_goal_recursive(
+            db=db,
+            goal_id=sub_goal_id,
+            repo_path=repo_path,
+            image=image,
+            runtime=runtime,
+            model_a=model_a,
+            model_b=model_b,
+            max_tools=max_tools,
+            max_decompositions=max_decompositions,
+            depth=depth + 1,
+            max_depth=max_depth,
+            parent_working_branch=goal_working_branch,  # Sub-goals build on parent's branch
+            current_model=other_model,  # The model that decomposed works on sub-goals
+            decomposition_count=decomposition_count + 1  # Increment decomposition count
+        )
+
+        if not success:
+            all_succeeded = False
+            logging.warning(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} failed - stopping remaining sub-goals")
+            break  # Fail fast - don't process remaining sub-goals
         else:
-            # Sub-goal failed - don't decompose further, just fail
-            logging.warning(f"{indent}[Goal {goal_id}] Sub-goal failed with outcome: {result['outcome']}")
-            logging.warning(f"{indent}[Goal {goal_id}] Not decomposing (sub-goals don't decompose) - marking as failed")
-            update_goal_status(db, goal_id, 'failed')
-            return False
+            logging.info(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} succeeded - changes merged into {goal_working_branch}")
 
-        # Work on each sub-goal sequentially
-        # Each sub-goal branches from parent's working branch,
-        # and successful attempts are merged back into it
-        # STOP on first failure (fail-fast)
-        all_succeeded = True
-        for i, sub_goal_id in enumerate(sub_goal_ids, 1):
-            logging.info(f"{indent}[Goal {goal_id}] Working on sub-goal {i}/{len(sub_goal_ids)}")
-
-            success = work_on_goal_recursive(
-                db=db,
-                goal_id=sub_goal_id,
-                repo_path=repo_path,
-                image=image,
-                runtime=runtime,
-                model_id=model_id,
-                depth=depth + 1,
-                max_depth=max_depth,
-                parent_working_branch=goal_working_branch  # Sub-goals build on parent's branch
-            )
-
-            if not success:
-                all_succeeded = False
-                logging.warning(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} failed - stopping remaining sub-goals")
-                break  # Fail fast - don't process remaining sub-goals
-            else:
-                logging.info(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} succeeded - changes merged into {goal_working_branch}")
-
-        # Update parent goal status based on sub-goals
-        if all_succeeded:
-            logging.info(f"{indent}[Goal {goal_id}] ✓ All sub-goals completed - marking as completed")
-            update_goal_status(db, goal_id, 'completed')
-            return True
-        else:
-            logging.warning(f"{indent}[Goal {goal_id}] ✗ Some sub-goals failed - marking as failed")
-            update_goal_status(db, goal_id, 'failed')
-            return False
+    # Update parent goal status based on sub-goals
+    if all_succeeded:
+        logging.info(f"{indent}[Goal {goal_id}] ✓ All sub-goals completed - marking as completed")
+        update_goal_status(db, goal_id, 'completed')
+        return True
+    else:
+        logging.warning(f"{indent}[Goal {goal_id}] ✗ Some sub-goals failed - marking as failed")
+        update_goal_status(db, goal_id, 'failed')
+        return False
 
 
 # ============================================================================
@@ -1797,7 +1913,6 @@ def create_session(goal_description, repo_path, base_branch='main'):
     create_session_record(db, session_id, goal_description,
                          os.path.abspath(repo_path), base_branch)
 
-    print(f"Created session: {session_dir}")
     return session_dir, db
 
 
@@ -1808,12 +1923,12 @@ def load_session(session_path):
     """
     session_dir = Path(session_path)
     if not session_dir.exists():
-        print(f"Error: Session directory not found: {session_dir}")
+        logging.error(f"Session directory not found: {session_dir}")
         sys.exit(1)
 
     db_path = session_dir / "goals.db"
     if not db_path.exists():
-        print(f"Error: Database not found: {db_path}")
+        logging.error(f"Database not found: {db_path}")
         sys.exit(1)
 
     db = sqlite3.connect(str(db_path))
@@ -1824,7 +1939,7 @@ def load_session(session_path):
 
     session_record = get_session_record(db)
 
-    print(f"Loaded session: {session_dir}")
+    logging.info(f"Loaded session: {session_dir}")
     return session_dir, db, session_record
 
 
@@ -1903,14 +2018,31 @@ def main():
 
     # Configuration options
     parser.add_argument(
-        '--model',
-        default='openrouter/anthropic/claude-haiku-4.5',
-        help='LLM model to use (default: openrouter/anthropic/claude-haiku-4.5)'
+        '--model-a',
+        default='openrouter/anthropic/claude-sonnet-4.5',
+        help='First model for collaborative peer review (default: claude-sonnet-4.5)'
+    )
+    parser.add_argument(
+        '--model-b',
+        default='openrouter/openai/gpt-5-codex',
+        help='Second model for collaborative peer review (default: gpt-5-codex)'
     )
     parser.add_argument(
         '--image',
         default='shots-on-goal:latest',
         help='Container image to use (default: shots-on-goal:latest)'
+    )
+    parser.add_argument(
+        '--max-tools',
+        type=int,
+        default=50,
+        help='Maximum number of tool calls per attempt (default: 50)'
+    )
+    parser.add_argument(
+        '--max-decompositions',
+        type=int,
+        default=5,
+        help='Maximum number of decompositions before giving up (default: 5)'
     )
     parser.add_argument(
         '--verbose',
@@ -1933,8 +2065,8 @@ def main():
     # Handle resume command
     if args.resume:
         session_dir, db, session_record = load_session(args.resume)
-        print(f"Resuming: {session_record['description']}")
-        print(f"Repo: {session_record['repo_path']}")
+        logging.info(f"Resuming: {session_record['description']}")
+        logging.info(f"Repo: {session_record['repo_path']}")
         # TODO: Resume work on goals
         db.close()
         return
@@ -1947,11 +2079,11 @@ def main():
     # Validate repo path
     repo_path = Path(args.repo_path)
     if not repo_path.exists():
-        print(f"Error: Repository path does not exist: {repo_path}")
+        logging.error(f"Repository path does not exist: {repo_path}")
         sys.exit(1)
 
     if not (repo_path / ".git").exists():
-        print(f"Error: Not a git repository: {repo_path}")
+        logging.error(f"Not a git repository: {repo_path}")
         sys.exit(1)
 
     # Create new session
@@ -1963,9 +2095,9 @@ def main():
     logging.info(f"Created root goal (ID: {root_goal_id}): {args.goal}")
 
     # Start working on the root goal (with decomposition)
-    print("\n" + "=" * 80)
-    print("Starting work on goal (with recursive decomposition)...")
-    print("=" * 80 + "\n")
+    logging.info("=" * 80)
+    logging.info("Starting work on goal (with recursive decomposition)...")
+    logging.info("=" * 80)
 
     try:
         success = work_on_goal_recursive(
@@ -1974,24 +2106,28 @@ def main():
             repo_path=str(repo_path),
             image=args.image,
             runtime=detect_container_runtime(),
-            model_id=args.model
+            model_a=args.model_a,
+            model_b=args.model_b,
+            max_tools=args.max_tools,
+            max_decompositions=args.max_decompositions
         )
 
-        print("\n" + "=" * 80)
-        print("Goal tree completed!")
-        print("=" * 80)
+        logging.info("=" * 80)
+        logging.info("Goal tree completed!")
+        logging.info("=" * 80)
 
         # Get final status
         final_goal = get_goal(db, root_goal_id)
-        print(f"\nRoot goal status: {final_goal['status']}")
+        logging.info(f"Root goal status: {final_goal['status']}")
 
         if success:
-            print("✓ Root goal completed successfully!")
+            logging.info("✓ Root goal completed successfully!")
         else:
-            print("✗ Root goal did not complete successfully")
+            logging.info("✗ Root goal did not complete successfully")
 
         # Show goal tree summary
-        print("\n--- Goal Tree Summary ---")
+        logging.info("")
+        logging.info("--- Goal Tree Summary ---")
         all_goals = db.execute("SELECT id, description, status, parent_id FROM goals ORDER BY id").fetchall()
         for goal in all_goals:
             depth = 0
@@ -2003,19 +2139,41 @@ def main():
 
             indent = "  " * depth
             status_icon = "✓" if goal['status'] == 'completed' else ("✗" if goal['status'] == 'failed' else "•")
-            print(f"{indent}{status_icon} Goal {goal['id']}: {goal['description'][:60]} [{goal['status']}]")
+            logging.info(f"{indent}{status_icon} Goal {goal['id']}: {goal['description'][:60]} [{goal['status']}]")
+
+        # Show worktree/branch information
+        logging.info("")
+        logging.info("--- Worktrees & Branches ---")
+        all_attempts = db.execute("""
+            SELECT a.id, a.goal_id, a.model_id, a.git_branch, a.worktree_path, a.outcome, a.final_commit_sha
+            FROM attempts a
+            ORDER BY a.id
+        """).fetchall()
+
+        for attempt in all_attempts:
+            if attempt['git_branch'] and attempt['worktree_path']:
+                status_icon = "✓" if attempt['outcome'] == 'success' else "✗"
+                model_short = shorten_model_name(attempt['model_id']) if attempt['model_id'] else 'unknown'
+                commit_info = f" (commit: {attempt['final_commit_sha'][:8]})" if attempt['final_commit_sha'] else ""
+                logging.info(f"{status_icon} Attempt {attempt['id']} (Goal {attempt['goal_id']}, Model: {model_short}): {attempt['outcome']}{commit_info}")
+                logging.info(f"    Branch: {attempt['git_branch']}")
+                logging.info(f"    Worktree: {attempt['worktree_path']}")
+                if attempt['final_commit_sha']:
+                    logging.info(f"    View: git show {attempt['final_commit_sha'][:8]}")
 
     except KeyboardInterrupt:
-        print("\n\nInterrupted by user. Session saved.")
+        logging.info("")
+        logging.info("Interrupted by user. Session saved.")
         update_session_status(db, 'interrupted')
     except Exception as e:
-        print(f"\n\nError during execution: {e}")
+        logging.error(f"Error during execution: {e}")
         update_session_status(db, 'failed')
         raise
     finally:
         db.close()
 
-    print(f"\nSession saved to: {session_dir}")
+    logging.info("")
+    logging.info(f"Session saved to: {session_dir}")
 
 
 if __name__ == "__main__":
