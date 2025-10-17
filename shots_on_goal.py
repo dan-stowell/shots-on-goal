@@ -1456,6 +1456,18 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
 
     logging.info(f"[V2] Created git worktree: {worktree_path} (branch: {branch_name})")
 
+    # Configure git for commits (defensive - may already be set)
+    subprocess.run(
+        ['git', 'config', 'user.email', 'shots-on-goal@example.com'],
+        cwd=worktree_path,
+        capture_output=True
+    )
+    subprocess.run(
+        ['git', 'config', 'user.name', 'Shots on Goal V2'],
+        cwd=worktree_path,
+        capture_output=True
+    )
+
     # Track worktree in database
     worktree_id = create_worktree_v2(
         db,
@@ -1571,7 +1583,33 @@ When you have successfully achieved the goal (or determined it cannot be achieve
         response_text = chain.text()
         logging.info(f"[V2] LLM completed - {len(tool_calls_made)} tools used")
 
-        # Determine outcome
+        # Check for uncommitted changes
+        status_result = subprocess.run(
+            ['git', 'status', '--porcelain'],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        has_changes = bool(status_result.stdout.strip())
+
+        if has_changes:
+            # Commit all changes
+            logging.info(f"[V2] Committing changes made by LLM...")
+            subprocess.run(['git', 'add', '-A'], cwd=worktree_path, check=True, capture_output=True)
+
+            commit_msg = f"[V2] Goal {goal_id}: {goal['goal_text'][:60]}\n\nAttempt {attempt_id} by {model_id}"
+            subprocess.run(
+                ['git', 'commit', '-m', commit_msg],
+                cwd=worktree_path,
+                check=True,
+                capture_output=True
+            )
+            logging.info(f"[V2] Changes committed")
+        else:
+            logging.info(f"[V2] No changes to commit")
+
+        # Get final commit SHA
         result = subprocess.run(
             ['git', 'rev-parse', 'HEAD'],
             cwd=worktree_path,
@@ -1581,7 +1619,7 @@ When you have successfully achieved the goal (or determined it cannot be achieve
         )
         end_sha = result.stdout.strip()
 
-        # Get diff
+        # Get diff between start and end
         diff_result = subprocess.run(
             ['git', 'diff', current_sha, end_sha],
             cwd=worktree_path,
@@ -1589,9 +1627,6 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             text=True
         )
         diff = diff_result.stdout
-
-        # Check if changes were made
-        has_changes = (end_sha != current_sha) or bool(diff)
 
         status = "completed"  # LLM finished
         status_detail = f"Used {len(tool_calls_made)} tools"
