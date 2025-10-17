@@ -714,6 +714,473 @@ def get_merge_v2(db, merge_id):
 
 
 # ============================================================================
+# Query Helpers V2 (Higher-level queries)
+# ============================================================================
+
+def get_goal_with_attempts_v2(db, goal_id):
+    """
+    Get a goal with all its attempts and their results.
+
+    Returns:
+        {
+            'goal': {...},
+            'attempts': [
+                {
+                    'attempt': {...},
+                    'result': {...} or None,
+                    'tool_call_count': int
+                },
+                ...
+            ]
+        }
+    """
+    goal = get_goal_v2(db, goal_id)
+    if not goal:
+        return None
+
+    attempts = []
+    for attempt in get_attempts_for_goal_v2(db, goal_id):
+        result = get_attempt_result_by_attempt_v2(db, attempt['id'])
+        tool_calls = get_tool_calls_v2(db, attempt['id'])
+
+        attempts.append({
+            'attempt': attempt,
+            'result': result,
+            'tool_call_count': len(tool_calls)
+        })
+
+    return {
+        'goal': goal,
+        'attempts': attempts
+    }
+
+
+def get_attempt_with_details_v2(db, attempt_id):
+    """
+    Get an attempt with all related information.
+
+    Returns:
+        {
+            'attempt': {...},
+            'goal': {...},
+            'worktree': {...},
+            'branch': {...},
+            'tools': [{...}, ...],
+            'tool_calls': [{...}, ...],
+            'result': {...} or None,
+            'validation_runs': [{...}, ...] if result exists
+        }
+    """
+    attempt = get_attempt_v2(db, attempt_id)
+    if not attempt:
+        return None
+
+    goal = get_goal_v2(db, attempt['goal_id'])
+    worktree = get_worktree_v2(db, attempt['worktree_id'])
+    branch = get_branch_v2(db, worktree['branch_id']) if worktree else None
+    tools = get_tools_for_attempt_v2(db, attempt_id)
+    tool_calls = get_tool_calls_v2(db, attempt_id)
+    result = get_attempt_result_by_attempt_v2(db, attempt_id)
+
+    validation_runs = []
+    if result:
+        validation_runs = get_validation_runs_v2(db, result['id'])
+
+    return {
+        'attempt': attempt,
+        'goal': goal,
+        'worktree': worktree,
+        'branch': branch,
+        'tools': tools,
+        'tool_calls': tool_calls,
+        'result': result,
+        'validation_runs': validation_runs
+    }
+
+
+def get_goal_tree_v2(db, goal_id):
+    """
+    Get a goal and all its descendants recursively.
+
+    Returns:
+        {
+            'goal': {...},
+            'children': [
+                {
+                    'goal': {...},
+                    'children': [...]
+                },
+                ...
+            ]
+        }
+    """
+    goal = get_goal_v2(db, goal_id)
+    if not goal:
+        return None
+
+    children = []
+    for child_goal in get_child_goals_v2(db, goal_id):
+        child_tree = get_goal_tree_v2(db, child_goal['id'])
+        if child_tree:
+            children.append(child_tree)
+
+    return {
+        'goal': goal,
+        'children': children
+    }
+
+
+def get_validation_status_v2(db, goal_id):
+    """
+    Check validation status for a goal's latest attempt.
+
+    Returns:
+        {
+            'has_validation': bool,
+            'all_passed': bool or None,
+            'step_count': int,
+            'passed_count': int,
+            'failed_count': int,
+            'steps': [
+                {
+                    'step': {...},
+                    'run': {...} or None,
+                    'passed': bool or None
+                },
+                ...
+            ]
+        }
+    """
+    # Get validation steps for this goal
+    validation_steps = get_validation_steps_v2(db, goal_id)
+
+    if not validation_steps:
+        return {
+            'has_validation': False,
+            'all_passed': None,
+            'step_count': 0,
+            'passed_count': 0,
+            'failed_count': 0,
+            'steps': []
+        }
+
+    # Get the latest attempt for this goal
+    attempts = get_attempts_for_goal_v2(db, goal_id)
+    if not attempts:
+        return {
+            'has_validation': True,
+            'all_passed': None,
+            'step_count': len(validation_steps),
+            'passed_count': 0,
+            'failed_count': 0,
+            'steps': [{'step': step, 'run': None, 'passed': None} for step in validation_steps]
+        }
+
+    latest_attempt = attempts[-1]  # Last one (ordered by timestamp)
+    result = get_attempt_result_by_attempt_v2(db, latest_attempt['id'])
+
+    if not result:
+        return {
+            'has_validation': True,
+            'all_passed': None,
+            'step_count': len(validation_steps),
+            'passed_count': 0,
+            'failed_count': 0,
+            'steps': [{'step': step, 'run': None, 'passed': None} for step in validation_steps]
+        }
+
+    # Get validation runs for this result
+    validation_runs = get_validation_runs_v2(db, result['id'])
+    runs_by_step = {run['validation_step_id']: run for run in validation_runs}
+
+    # Build status for each step
+    steps_status = []
+    passed_count = 0
+    failed_count = 0
+
+    for step in validation_steps:
+        run = runs_by_step.get(step['id'])
+        passed = run['exit_code'] == 0 if run else None
+
+        if passed is True:
+            passed_count += 1
+        elif passed is False:
+            failed_count += 1
+
+        steps_status.append({
+            'step': step,
+            'run': run,
+            'passed': passed
+        })
+
+    all_passed = passed_count == len(validation_steps) if validation_runs else None
+
+    return {
+        'has_validation': True,
+        'all_passed': all_passed,
+        'step_count': len(validation_steps),
+        'passed_count': passed_count,
+        'failed_count': failed_count,
+        'steps': steps_status
+    }
+
+
+def get_goal_ancestry_v2(db, goal_id):
+    """
+    Get the ancestry chain from goal back to root.
+
+    Returns:
+        [root_goal, ..., parent_goal, goal]
+    """
+    ancestry = []
+    current_id = goal_id
+
+    while current_id:
+        goal = get_goal_v2(db, current_id)
+        if not goal:
+            break
+        ancestry.insert(0, goal)  # Prepend to build root-to-leaf order
+        current_id = goal['parent_goal_id']
+
+    return ancestry
+
+
+def get_attempts_summary_v2(db, goal_id):
+    """
+    Get summary statistics for all attempts on a goal.
+
+    Returns:
+        {
+            'total_attempts': int,
+            'by_model': {model_name: count, ...},
+            'by_type': {attempt_type: count, ...},
+            'by_status': {status: count, ...},
+            'total_tool_calls': int
+        }
+    """
+    attempts = get_attempts_for_goal_v2(db, goal_id)
+
+    by_model = {}
+    by_type = {}
+    by_status = {}
+    total_tool_calls = 0
+
+    for attempt in attempts:
+        # Count by model
+        model = attempt['model']
+        by_model[model] = by_model.get(model, 0) + 1
+
+        # Count by type
+        attempt_type = attempt['attempt_type']
+        by_type[attempt_type] = by_type.get(attempt_type, 0) + 1
+
+        # Count tool calls
+        tool_calls = get_tool_calls_v2(db, attempt['id'])
+        total_tool_calls += len(tool_calls)
+
+        # Count by status (if result exists)
+        result = get_attempt_result_by_attempt_v2(db, attempt['id'])
+        if result:
+            status = result['status']
+            by_status[status] = by_status.get(status, 0) + 1
+
+    return {
+        'total_attempts': len(attempts),
+        'by_model': by_model,
+        'by_type': by_type,
+        'by_status': by_status,
+        'total_tool_calls': total_tool_calls
+    }
+
+
+# ============================================================================
+# Orchestration V2 (Simplified demonstration)
+# ============================================================================
+
+def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
+                           attempt_type='implementation', max_tools=50):
+    """
+    Simplified V2 orchestration demonstrating the schema integration pattern.
+
+    This is a minimal working example showing how V2 schema integrates with
+    the orchestration layer. It handles:
+    - Branch and worktree creation
+    - Attempt tracking
+    - Tool call recording
+    - Result creation
+    - Validation runs
+
+    Args:
+        db: Database connection
+        session_id: Session ID
+        goal_id: Goal to work on
+        repo_path: Repository path
+        model_id: Model to use
+        attempt_type: 'implementation' or 'breakdown'
+        max_tools: Max tool calls allowed
+
+    Returns:
+        {
+            'success': bool,
+            'attempt_id': int,
+            'result_id': int,
+            'validation_passed': bool or None
+        }
+    """
+    import subprocess
+
+    # Get goal and session
+    goal = get_goal_v2(db, goal_id)
+    session = get_session_v2(db, session_id)
+
+    if not goal or not session:
+        raise ValueError("Goal or session not found")
+
+    logging.info(f"[V2] Working on goal {goal_id}: {goal['goal_text'][:60]}")
+
+    # Get current commit SHA
+    result = subprocess.run(
+        ['git', 'rev-parse', 'HEAD'],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        check=True
+    )
+    current_sha = result.stdout.strip()
+
+    # Create or get branch for this goal
+    branch_name = f"goal-{goal_id}-v2"
+    existing_branch = get_branch_by_name_v2(db, session_id, branch_name)
+
+    if existing_branch:
+        branch_id = existing_branch['id']
+        logging.debug(f"[V2] Using existing branch: {branch_name}")
+    else:
+        branch_id = create_branch_v2(
+            db,
+            session_id=session_id,
+            name=branch_name,
+            parent_commit_sha=current_sha,
+            reason=f"Goal {goal_id}",
+            created_by_goal_id=goal_id
+        )
+        logging.info(f"[V2] Created branch: {branch_name}")
+
+    # Create worktree (in practice, we'd actually create a git worktree)
+    # For this demo, we just track it in the database
+    worktree_path = f"{repo_path}/worktrees/goal-{goal_id}-attempt"
+    worktree_id = create_worktree_v2(
+        db,
+        branch_id=branch_id,
+        path=worktree_path,
+        start_sha=current_sha,
+        reason=f"Attempt for goal {goal_id}"
+    )
+    logging.info(f"[V2] Created worktree: {worktree_path}")
+
+    # Create attempt
+    prompt = f"Goal: {goal['goal_text']}\n\nPlease complete this goal."
+    attempt_id = create_attempt_v2(
+        db,
+        goal_id=goal_id,
+        worktree_id=worktree_id,
+        start_commit_sha=current_sha,
+        prompt=prompt,
+        model=model_id,
+        attempt_type=attempt_type
+    )
+    logging.info(f"[V2] Created attempt {attempt_id} with {model_id}")
+
+    # Get tools for this session
+    tools = get_tools_for_session_v2(db, session_id)
+
+    # Link tools to attempt
+    for tool in tools:
+        create_attempt_tool_v2(db, attempt_id, tool['id'])
+    logging.debug(f"[V2] Linked {len(tools)} tools to attempt")
+
+    # Simulate LLM execution with tool calls
+    # In real implementation, this would invoke LLM and record actual tool calls
+    # For demo, we'll simulate a few tool calls
+    simulated_tool_calls = [
+        {'tool': tools[0], 'input': '{"path": "README.md"}', 'output': 'file contents'},
+        {'tool': tools[0], 'input': '{"path": "BUILD"}', 'output': 'build file'},
+    ] if tools else []
+
+    for i, call_data in enumerate(simulated_tool_calls, 1):
+        create_tool_call_v2(
+            db,
+            attempt_id=attempt_id,
+            order_num=i,
+            tool_id=call_data['tool']['id'],
+            tool_name=call_data['tool']['name'],
+            input_data=call_data['input'],
+            output=call_data['output']
+        )
+        if i >= max_tools:
+            logging.warning(f"[V2] Reached max_tools limit: {max_tools}")
+            break
+
+    logging.info(f"[V2] Recorded {len(simulated_tool_calls)} tool calls")
+
+    # Simulate getting final SHA (in real implementation, from git)
+    end_sha = current_sha  # In demo, same as start
+    diff = "mock diff"
+
+    # Determine status (for demo, we'll say success)
+    status = "success"
+    status_detail = None
+
+    # Create attempt result
+    result_id = create_attempt_result_v2(
+        db,
+        attempt_id=attempt_id,
+        end_commit_sha=end_sha,
+        diff=diff,
+        status=status,
+        status_detail=status_detail
+    )
+    logging.info(f"[V2] Created attempt result {result_id}: {status}")
+
+    # Run validation if goal has validation steps
+    validation_steps = get_validation_steps_v2(db, goal_id)
+    validation_passed = None
+
+    if validation_steps:
+        logging.info(f"[V2] Running {len(validation_steps)} validation steps")
+        all_passed = True
+
+        for step in validation_steps:
+            # In real implementation, would execute the command
+            # For demo, simulate exit code
+            exit_code = 0  # Simulate success
+            output = f"Simulated output for: {step['command']}"
+
+            create_validation_run_v2(
+                db,
+                validation_step_id=step['id'],
+                attempt_result_id=result_id,
+                exit_code=exit_code,
+                output=output
+            )
+
+            if exit_code != 0:
+                all_passed = False
+
+        validation_passed = all_passed
+        logging.info(f"[V2] Validation: {'PASSED' if validation_passed else 'FAILED'}")
+
+    success = (status == "success") and (validation_passed is not False)
+
+    return {
+        'success': success,
+        'attempt_id': attempt_id,
+        'result_id': result_id,
+        'validation_passed': validation_passed
+    }
+
+
+# ============================================================================
 # Database Helper Functions
 # ============================================================================
 
