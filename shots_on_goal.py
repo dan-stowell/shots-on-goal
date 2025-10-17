@@ -1509,6 +1509,18 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
         logging.info(f"[V2] Calling LLM {model_id}...")
         model = llm.get_model(model_id)
 
+        # Get validation steps to include in prompt
+        validation_steps = get_validation_steps_v2(db, goal_id)
+        validation_text = ""
+        if validation_steps:
+            validation_text = "\n\n**Success criteria (validation commands):**\n"
+            validation_text += "Your changes will be validated by running these commands:\n"
+            for step in validation_steps:
+                validation_text += f"- `{step['command']}`\n"
+            validation_text += "\n**IMPORTANT:** Run these validation commands yourself using the appropriate tools (e.g., bazel_build, bazel_test).\n"
+            validation_text += "Once ALL validation commands pass, STOP making changes and explain that you've completed the goal.\n"
+            validation_text += "Do NOT continue making unnecessary changes or writing documentation after validation passes."
+
         system_prompt = f"""You are an autonomous coding agent working on a specific goal in a git repository.
 
 You have access to tools to read files, search code, modify files, and run Bazel commands.
@@ -1516,15 +1528,15 @@ You have access to tools to read files, search code, modify files, and run Bazel
 **Important constraints:**
 - You have {max_tools} tool calls to achieve this goal
 - Use tools efficiently to stay within the limit
-- For Bazel projects: use MODULE.bazel with bzlmod, NOT WORKSPACE files
+- For Bazel projects: use MODULE.bazel with bzlmod, NOT WORKSPACE files{validation_text}
 
 Your task is to work towards achieving the goal. You should:
 1. Explore the repository to understand its structure
 2. Make necessary changes to achieve the goal
-3. Test your changes using Bazel build/test commands when appropriate
-4. Be methodical and explain your reasoning
+3. Validate your changes by running the validation commands listed above
+4. STOP once validation passes - do not make unnecessary changes
 
-When you have successfully achieved the goal (or determined it cannot be achieved), explain your final status clearly."""
+When you have successfully achieved the goal (or determined it cannot be achieved), explain your final status clearly and STOP."""
 
         chain = model.chain(
             goal['goal_text'],
