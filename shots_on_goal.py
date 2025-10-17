@@ -170,7 +170,7 @@ def init_database(db_path):
     Initialize SQLite database with schema.
     Returns connection object.
     """
-    db = sqlite3.connect(db_path)
+    db = sqlite3.connect(db_path, check_same_thread=False)
     db.row_factory = sqlite3.Row  # Access columns by name
 
     # Enable foreign key constraints
@@ -1372,6 +1372,24 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
 
     # Initialize variables for exception handling
     actions = []
+    pending_actions_for_db = []
+    actions_flushed = False
+
+    def flush_pending_actions():
+        nonlocal actions_flushed
+        if actions_flushed:
+            return
+        for pending in pending_actions_for_db:
+            record_action(
+                db,
+                attempt_id,
+                pending['tool'],
+                pending['arguments'],
+                pending['output']
+            )
+        actions_flushed = True
+        pending_actions_for_db.clear()
+
     container = ContainerManager(image=image, runtime=runtime)
 
     try:
@@ -1424,13 +1442,11 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
             args_str = str(tool_call.arguments)[:100]  # Truncate long args
             logging.info(f"  Tool {len(actions)+1}/{max_tools}: {tool_name}({args_str})")
 
-            record_action(
-                db,
-                attempt_id,
-                tool_name,
-                tool_call.arguments,
-                tool_result.output
-            )
+            pending_actions_for_db.append({
+                "tool": tool_name,
+                "arguments": tool_call.arguments,
+                "output": tool_result.output
+            })
             actions.append({
                 "tool": tool_name,
                 "arguments": tool_call.arguments,
@@ -1519,6 +1535,8 @@ When you have successfully achieved the goal (or determined it cannot be achieve
         # ============================================================
         # Determine outcome
         # ============================================================
+
+        flush_pending_actions()
 
         # Check if code changes were made
         git_status_result = subprocess.run(
@@ -1643,6 +1661,7 @@ When you have successfully achieved the goal (or determined it cannot be achieve
     except ToolLimitExceeded as e:
         # Tool limit exceeded - report this specific outcome
         logging.warning(f"[Attempt {attempt_id}] Tool limit exceeded")
+        flush_pending_actions()
 
         # Commit changes even if we hit the limit
         if 'worktree_path' in locals():
@@ -1668,6 +1687,7 @@ When you have successfully achieved the goal (or determined it cannot be achieve
     except LLMTimeoutError as e:
         # LLM call timed out - report this specific outcome
         logging.warning(f"[Attempt {attempt_id}] LLM timeout: {e}")
+        flush_pending_actions()
 
         # Commit changes even on timeout
         if 'worktree_path' in locals():
@@ -1693,6 +1713,7 @@ When you have successfully achieved the goal (or determined it cannot be achieve
     except Exception as e:
         # If something went wrong, record as error
         logging.error(f"[Attempt {attempt_id}] Error: {e}")
+        flush_pending_actions()
 
         # Commit changes even on error
         if 'worktree_path' in locals():
@@ -1719,6 +1740,7 @@ When you have successfully achieved the goal (or determined it cannot be achieve
         }
 
     finally:
+        flush_pending_actions()
         # Always clean up container
         container.stop()
         logging.debug(f"[Attempt {attempt_id}] Cleaned up container")
@@ -2116,7 +2138,7 @@ def load_session(session_path):
         logging.error(f"Database not found: {db_path}")
         sys.exit(1)
 
-    db = sqlite3.connect(str(db_path))
+    db = sqlite3.connect(str(db_path), check_same_thread=False)
     db.row_factory = sqlite3.Row
 
     # Enable foreign key constraints
@@ -2144,7 +2166,7 @@ def list_sessions():
         if not db_path.exists():
             continue
 
-        db = sqlite3.connect(str(db_path))
+        db = sqlite3.connect(str(db_path), check_same_thread=False)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys = ON")
 
