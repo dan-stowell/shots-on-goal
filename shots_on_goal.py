@@ -991,6 +991,21 @@ class WorktreeToolExecutor:
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
+    def write_multiple_files(self, files_dict):
+        """
+        Write multiple files at once.
+
+        Args:
+            files_dict: Dict mapping file paths to content strings
+
+        Returns:
+            dict mapping path to result dict with 'success' and 'error'
+        """
+        results = {}
+        for path, content in files_dict.items():
+            results[path] = self.write_file(path, content)
+        return results
+
     def find_replace_in_file(self, path, old_text, new_text):
         """Find and replace text in a file (must match exactly once)."""
         try:
@@ -1126,6 +1141,32 @@ def create_v2_tool_functions(tools_executor):
             return f"Successfully wrote to {path}"
         else:
             return f"ERROR: {result['error']}"
+
+    def write_multiple_files(files: dict) -> str:
+        """
+        Write multiple files at once (more efficient than calling write_file multiple times).
+
+        Args:
+            files: Dict mapping file paths to content strings
+                   Example: {"src/foo.py": "content1", "src/bar.py": "content2"}
+
+        Returns:
+            Summary of files written or errors
+        """
+        results = tools_executor.write_multiple_files(files)
+        output = []
+        success_count = 0
+        for path, result in results.items():
+            if result['success']:
+                success_count += 1
+                output.append(f"✓ {path}")
+            else:
+                output.append(f"✗ {path}: {result['error']}")
+
+        summary = f"Wrote {success_count}/{len(results)} files successfully"
+        if output:
+            return f"{summary}\n" + "\n".join(output)
+        return summary
 
     def find_replace_in_file(path: str, old_text: str, new_text: str) -> str:
         """
@@ -1274,6 +1315,7 @@ def create_v2_tool_functions(tools_executor):
         read_file,
         read_multiple_files,
         write_file,
+        write_multiple_files,
         find_replace_in_file,
         list_directory,
         find_files,
@@ -2562,6 +2604,32 @@ def create_tool_functions(tools_executor):
         else:
             return f"ERROR: {result['error']}"
 
+    def write_multiple_files(files: dict) -> str:
+        """
+        Write multiple files at once (more efficient than calling write_file multiple times).
+
+        Args:
+            files: Dict mapping file paths to content strings
+                   Example: {"src/foo.py": "content1", "src/bar.py": "content2"}
+
+        Returns:
+            Summary of files written or errors
+        """
+        results = tools_executor.write_multiple_files(files)
+        output = []
+        success_count = 0
+        for path, result in results.items():
+            if result['success']:
+                success_count += 1
+                output.append(f"✓ {path}")
+            else:
+                output.append(f"✗ {path}: {result['error']}")
+
+        summary = f"Wrote {success_count}/{len(results)} files successfully"
+        if output:
+            return f"{summary}\n" + "\n".join(output)
+        return summary
+
     def find_replace_in_file(path: str, old_text: str, new_text: str) -> str:
         """
         Find and replace text in a file. Requires exactly one match.
@@ -2709,6 +2777,7 @@ def create_tool_functions(tools_executor):
         read_file,
         read_multiple_files,
         write_file,
+        write_multiple_files,
         find_replace_in_file,
         list_directory,
         find_files,
@@ -2853,6 +2922,7 @@ def main():
         ('read_file', 'Read a file from the workspace'),
         ('read_multiple_files', 'Read multiple files at once (more efficient than calling read_file multiple times)'),
         ('write_file', 'Write content to a file'),
+        ('write_multiple_files', 'Write multiple files at once (more efficient than calling write_file multiple times)'),
         ('find_replace_in_file', 'Find and replace text in a file'),
         ('list_directory', 'List files in a directory'),
         ('find_files', 'Find files by name pattern'),
