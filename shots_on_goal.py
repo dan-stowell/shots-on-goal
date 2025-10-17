@@ -21,6 +21,99 @@ from llm.utils import extract_fenced_code_block
 
 
 # ============================================================================
+# Git Utilities
+# ============================================================================
+
+def detect_default_branch(repo_path):
+    """
+    Detect the default branch of a git repository.
+
+    Tries multiple methods:
+    1. Check current branch
+    2. Check remote HEAD (origin/HEAD)
+    3. Fall back to common names (main, master)
+
+    Args:
+        repo_path: Path to the git repository
+
+    Returns:
+        The name of the default branch (e.g., 'main', 'master')
+
+    Raises:
+        ValueError: If no suitable branch can be detected
+    """
+    # Try method 1: Get the current branch
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        branch = result.stdout.strip()
+        if branch and branch != 'HEAD':
+            logging.debug(f"Detected current branch: {branch}")
+            return branch
+    except subprocess.CalledProcessError:
+        pass
+
+    # Try method 2: Check remote HEAD (origin/HEAD -> origin/main)
+    try:
+        result = subprocess.run(
+            ['git', 'symbolic-ref', 'refs/remotes/origin/HEAD'],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        # Output is like "refs/remotes/origin/main"
+        remote_head = result.stdout.strip()
+        if remote_head.startswith('refs/remotes/origin/'):
+            branch = remote_head.replace('refs/remotes/origin/', '')
+            logging.debug(f"Detected default branch from origin/HEAD: {branch}")
+            return branch
+    except subprocess.CalledProcessError:
+        pass
+
+    # Try method 3: Check for common branch names
+    try:
+        result = subprocess.run(
+            ['git', 'branch', '--list'],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        branches = [line.strip().lstrip('* ') for line in result.stdout.split('\n') if line.strip()]
+
+        # Prefer main, then master, then take the first one
+        for preferred in ['main', 'master']:
+            if preferred in branches:
+                logging.debug(f"Detected branch from common names: {preferred}")
+                return preferred
+
+        # If we have any branches, use the first
+        if branches:
+            logging.debug(f"Using first available branch: {branches[0]}")
+            return branches[0]
+    except subprocess.CalledProcessError:
+        pass
+
+    # If all methods fail, raise an error
+    raise ValueError(f"Could not detect default branch in repository: {repo_path}")
+
+
+# ============================================================================
+# Timeout Utilities
+# ============================================================================
+
+class LLMTimeoutError(Exception):
+    """Raised when an LLM call exceeds the timeout."""
+    pass
+
+
+# ============================================================================
 # Database Setup
 # ============================================================================
 
@@ -1231,6 +1324,25 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
 
     # Initialize variables for exception handling
     actions = []
+    pending_actions_for_db = []
+    actions_flushed = False
+    last_activity_time = [time.time()]  # Use list for mutability in closure
+
+    def flush_pending_actions():
+        nonlocal actions_flushed
+        if actions_flushed:
+            return
+        for pending in pending_actions_for_db:
+            record_action(
+                db,
+                attempt_id,
+                pending['tool'],
+                pending['arguments'],
+                pending['output']
+            )
+        actions_flushed = True
+        pending_actions_for_db.clear()
+
     container = ContainerManager(image=image, runtime=runtime)
 
     try:
@@ -1276,6 +1388,15 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         # Set up after_call hook to record tool calls
         def after_call(tool, tool_call, tool_result):
             """Record each tool call in the database"""
+            # Check for timeout (no activity for 2 minutes)
+            elapsed = time.time() - last_activity_time[0]
+            if elapsed > 120:
+                logging.error(f"[Attempt {attempt_id}] Timeout: No activity for {elapsed:.1f} seconds")
+                raise LLMTimeoutError(f"No API activity for {elapsed:.1f} seconds (timeout: 120s)")
+
+            # Update activity timestamp
+            last_activity_time[0] = time.time()
+
             # Get tool name safely - handles both llm.Tool instances and plain functions
             tool_name = getattr(tool, "name", getattr(tool, "__name__", "unknown"))
 
@@ -1283,13 +1404,11 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
             args_str = str(tool_call.arguments)[:100]  # Truncate long args
             logging.info(f"  Tool {len(actions)+1}/{max_tools}: {tool_name}({args_str})")
 
-            record_action(
-                db,
-                attempt_id,
-                tool_name,
-                tool_call.arguments,
-                tool_result.output
-            )
+            pending_actions_for_db.append({
+                "tool": tool_name,
+                "arguments": tool_call.arguments,
+                "output": tool_result.output
+            })
             actions.append({
                 "tool": tool_name,
                 "arguments": tool_call.arguments,
@@ -1365,7 +1484,7 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             after_call=after_call
         )
 
-        # Get the response text
+        # Get the response text (timeout is checked in after_call)
         response_text = chain.text()
 
         logging.info(f"[Attempt {attempt_id}] LLM agent completed - {len(actions)} tools used")
@@ -1374,6 +1493,8 @@ When you have successfully achieved the goal (or determined it cannot be achieve
         # ============================================================
         # Determine outcome
         # ============================================================
+
+        flush_pending_actions()
 
         # Check if code changes were made
         git_status_result = subprocess.run(
@@ -1498,6 +1619,7 @@ When you have successfully achieved the goal (or determined it cannot be achieve
     except ToolLimitExceeded as e:
         # Tool limit exceeded - report this specific outcome
         logging.warning(f"[Attempt {attempt_id}] Tool limit exceeded")
+        flush_pending_actions()
 
         # Commit changes even if we hit the limit
         if 'worktree_path' in locals():
@@ -1520,9 +1642,36 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             'attempt_branch': branch_name if 'branch_name' in locals() else None
         }
 
+    except LLMTimeoutError as e:
+        # LLM call timed out - report this specific outcome
+        logging.warning(f"[Attempt {attempt_id}] LLM timeout: {e}")
+        flush_pending_actions()
+
+        # Commit changes even on timeout
+        if 'worktree_path' in locals():
+            final_commit_sha = git_manager.commit_worktree_changes(
+                worktree_path,
+                f"Attempt {attempt_id}: llm_timeout\n\nGoal: {goal_description}"
+            )
+            if final_commit_sha:
+                logging.info(f"[Attempt {attempt_id}] Committed changes: {final_commit_sha[:8]}")
+                update_attempt_metadata(db, attempt_id, final_commit_sha=final_commit_sha)
+
+        update_attempt_outcome(db, attempt_id, "llm_timeout", str(e))
+
+        return {
+            'success': False,
+            'attempt_id': attempt_id,
+            'actions': actions,
+            'outcome': "llm_timeout",
+            'error': str(e),
+            'attempt_branch': branch_name if 'branch_name' in locals() else None
+        }
+
     except Exception as e:
         # If something went wrong, record as error
         logging.error(f"[Attempt {attempt_id}] Error: {e}")
+        flush_pending_actions()
 
         # Commit changes even on error
         if 'worktree_path' in locals():
@@ -1549,6 +1698,7 @@ When you have successfully achieved the goal (or determined it cannot be achieve
         }
 
     finally:
+        flush_pending_actions()
         # Always clean up container
         container.stop()
         logging.debug(f"[Attempt {attempt_id}] Cleaned up container")
@@ -1644,8 +1794,16 @@ Return ONLY valid JSON (you can wrap in ```json if you want):
 
     # Get LLM to decompose
     model = llm.get_model(model_id)
-    response = model.prompt(decomposition_prompt)
-    response_text = response.text().strip()
+    logging.debug(f"[Goal {goal_id}] Requesting decomposition from {model_id}")
+
+    try:
+        response = model.prompt(decomposition_prompt)
+        response_text = response.text().strip()
+    except Exception as e:
+        logging.error(f"[Goal {goal_id}] Decomposition failed: {e}")
+        # Mark goal as failed instead of creating retry loop
+        update_goal_status(db, goal_id, 'failed')
+        return []
 
     logging.debug(f"[Goal {goal_id}] Decomposition response: {response_text}")
 
@@ -2086,8 +2244,16 @@ def main():
         logging.error(f"Not a git repository: {repo_path}")
         sys.exit(1)
 
+    # Detect default branch
+    try:
+        base_branch = detect_default_branch(str(repo_path))
+        logging.info(f"Detected base branch: {base_branch}")
+    except ValueError as e:
+        logging.error(str(e))
+        sys.exit(1)
+
     # Create new session
-    session_dir, db = create_session(args.goal, str(repo_path))
+    session_dir, db = create_session(args.goal, str(repo_path), base_branch)
     logging.info(f"Created session: {session_dir.name}")
 
     # Create root goal
