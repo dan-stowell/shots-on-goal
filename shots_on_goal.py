@@ -994,21 +994,375 @@ def get_attempts_summary_v2(db, goal_id):
 
 
 # ============================================================================
-# Orchestration V2 (Simplified demonstration)
+# Orchestration V2 - Tool Execution
+# ============================================================================
+
+class WorktreeToolExecutor:
+    """Executes tools directly in a worktree (no container isolation)."""
+
+    def __init__(self, worktree_path):
+        """
+        Initialize with a worktree path.
+
+        Args:
+            worktree_path: Path to the git worktree
+        """
+        self.worktree_path = worktree_path
+
+    def _run_command(self, cmd, timeout=60):
+        """
+        Run a shell command in the worktree.
+
+        Args:
+            cmd: Command string to execute
+            timeout: Timeout in seconds
+
+        Returns:
+            dict with 'success', 'stdout', 'stderr', 'exit_code'
+        """
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=self.worktree_path,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return {
+                'success': result.returncode == 0,
+                'stdout': result.stdout,
+                'stderr': result.stderr,
+                'exit_code': result.returncode
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                'success': False,
+                'stdout': '',
+                'stderr': f'Command timed out after {timeout}s',
+                'exit_code': -1
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'stdout': '',
+                'stderr': str(e),
+                'exit_code': -1
+            }
+
+    # File Operations
+
+    def read_file(self, path):
+        """Read a file from the worktree."""
+        try:
+            full_path = os.path.join(self.worktree_path, path)
+            with open(full_path, 'r') as f:
+                content = f.read()
+            return {'success': True, 'content': content, 'error': None}
+        except Exception as e:
+            return {'success': False, 'content': None, 'error': str(e)}
+
+    def write_file(self, path, content):
+        """Write content to a file in the worktree."""
+        try:
+            full_path = os.path.join(self.worktree_path, path)
+            # Create parent directories if needed
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, 'w') as f:
+                f.write(content)
+            return {'success': True, 'error': None}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def find_replace_in_file(self, path, old_text, new_text):
+        """Find and replace text in a file (must match exactly once)."""
+        try:
+            full_path = os.path.join(self.worktree_path, path)
+            with open(full_path, 'r') as f:
+                content = f.read()
+
+            count = content.count(old_text)
+            if count == 0:
+                return {'success': False, 'error': f'Text not found in {path}'}
+            elif count > 1:
+                return {'success': False, 'error': f'Text appears {count} times (expected exactly 1)'}
+
+            new_content = content.replace(old_text, new_text)
+            with open(full_path, 'w') as f:
+                f.write(new_content)
+
+            return {'success': True, 'error': None}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def list_directory(self, path="."):
+        """List files in a directory."""
+        try:
+            full_path = os.path.join(self.worktree_path, path)
+            files = os.listdir(full_path)
+            return {'success': True, 'files': sorted(files), 'error': None}
+        except Exception as e:
+            return {'success': False, 'files': [], 'error': str(e)}
+
+    def find_files(self, pattern, path="."):
+        """Find files by glob pattern."""
+        result = self._run_command(f'find {path} -name "{pattern}" -type f', timeout=30)
+        if result['success']:
+            files = [f.strip() for f in result['stdout'].split('\n') if f.strip()]
+            return {'success': True, 'files': files, 'error': None}
+        else:
+            return {'success': False, 'files': [], 'error': result['stderr']}
+
+    def ripgrep(self, pattern, path=".", glob=None, ignore_case=False):
+        """Search code using ripgrep."""
+        cmd = f'rg --json "{pattern}" {path}'
+        if glob:
+            cmd += f' -g "{glob}"'
+        if ignore_case:
+            cmd += ' -i'
+
+        result = self._run_command(cmd, timeout=30)
+        return result
+
+    # Bazel Tools
+
+    def bazel_build(self, targets="//...", flags=None):
+        """Build Bazel targets."""
+        cmd = f"bazel build {targets}"
+        if flags:
+            cmd += " " + " ".join(flags)
+        return self._run_command(cmd, timeout=600)
+
+    def bazel_test(self, targets="//...", flags=None):
+        """Run Bazel tests."""
+        cmd = f"bazel test {targets}"
+        if flags:
+            cmd += " " + " ".join(flags)
+        return self._run_command(cmd, timeout=600)
+
+    def bazel_query(self, query):
+        """Query the Bazel build graph."""
+        query_escaped = query.replace('"', '\\"')
+        cmd = f'bazel query "{query_escaped}"'
+        return self._run_command(cmd, timeout=60)
+
+
+def create_v2_tool_functions(tools_executor):
+    """
+    Create LLM tool functions for V2 (using WorktreeToolExecutor).
+
+    Args:
+        tools_executor: WorktreeToolExecutor instance
+
+    Returns:
+        List of tool functions with docstrings
+    """
+
+    def read_file(path: str) -> str:
+        """
+        Read a file from the workspace.
+
+        Args:
+            path: Path to file relative to workspace root
+
+        Returns:
+            File contents as a string
+        """
+        result = tools_executor.read_file(path)
+        if result['success']:
+            return result['content']
+        else:
+            return f"ERROR: {result['error']}"
+
+    def write_file(path: str, content: str) -> str:
+        """
+        Write content to a file in the workspace.
+
+        Args:
+            path: Path to file relative to workspace root
+            content: Content to write to the file
+
+        Returns:
+            Success message or error
+        """
+        result = tools_executor.write_file(path, content)
+        if result['success']:
+            return f"Successfully wrote to {path}"
+        else:
+            return f"ERROR: {result['error']}"
+
+    def find_replace_in_file(path: str, old_text: str, new_text: str) -> str:
+        """
+        Find and replace text in a file. Requires exactly one match.
+
+        Args:
+            path: Path to file relative to workspace root
+            old_text: Text to find (must match exactly once)
+            new_text: Text to replace with
+
+        Returns:
+            Success message or error
+        """
+        result = tools_executor.find_replace_in_file(path, old_text, new_text)
+        if result['success']:
+            return f"Successfully replaced text in {path}"
+        else:
+            return f"ERROR: {result['error']}"
+
+    def list_directory(path: str = ".") -> str:
+        """
+        List files in a directory.
+
+        Args:
+            path: Directory path (default: current directory)
+
+        Returns:
+            Newline-separated list of files
+        """
+        result = tools_executor.list_directory(path)
+        if result['success']:
+            return "\n".join(result['files'])
+        else:
+            return f"ERROR: {result['error']}"
+
+    def find_files(pattern: str, path: str = ".") -> str:
+        """
+        Find files by name pattern.
+
+        Args:
+            pattern: Filename pattern (glob style, e.g., "*.py" or "BUILD*")
+            path: Path to search in (default: current directory)
+
+        Returns:
+            Newline-separated list of matching file paths
+        """
+        result = tools_executor.find_files(pattern, path)
+        if result['success']:
+            return "\n".join(result['files']) if result['files'] else "No files found"
+        else:
+            return f"ERROR: {result['error']}"
+
+    def ripgrep(pattern: str, path: str = ".", glob: str = None, ignore_case: bool = False) -> str:
+        """
+        Search code using ripgrep.
+
+        Args:
+            pattern: Search pattern (regex)
+            path: Path to search in (default: current directory)
+            glob: Optional glob pattern to filter files (e.g., "*.py")
+            ignore_case: Case-insensitive search (default: false)
+
+        Returns:
+            Search results in JSON format
+        """
+        result = tools_executor.ripgrep(pattern, path, glob, ignore_case)
+        if result['success']:
+            return result['stdout'] if result['stdout'] else "No matches found"
+        else:
+            return f"ERROR: {result['stderr']}"
+
+    def bazel_build(targets: str = "//...", flags: str = None) -> str:
+        """
+        Build Bazel targets.
+
+        Args:
+            targets: Bazel target pattern (default: //...)
+            flags: Optional space-separated bazel flags
+
+        Returns:
+            Build output or error message
+        """
+        flag_list = flags.split() if flags else None
+        result = tools_executor.bazel_build(targets, flag_list)
+
+        output = []
+        if result['stdout']:
+            output.append(result['stdout'])
+        if result['stderr']:
+            output.append(result['stderr'])
+
+        if result['success']:
+            return "\n".join(output) or "Build succeeded"
+        else:
+            return f"Build failed (exit code {result['exit_code']}):\n" + "\n".join(output)
+
+    def bazel_test(targets: str = "//...", flags: str = None) -> str:
+        """
+        Run Bazel tests.
+
+        Args:
+            targets: Bazel test target pattern (default: //...)
+            flags: Optional space-separated bazel flags
+
+        Returns:
+            Test output or error message
+        """
+        flag_list = flags.split() if flags else None
+        result = tools_executor.bazel_test(targets, flag_list)
+
+        output = []
+        if result['stdout']:
+            output.append(result['stdout'])
+        if result['stderr']:
+            output.append(result['stderr'])
+
+        if result['success']:
+            return "\n".join(output) or "Tests passed"
+        else:
+            return f"Tests failed (exit code {result['exit_code']}):\n" + "\n".join(output)
+
+    def bazel_query(query: str) -> str:
+        """
+        Query the Bazel build graph.
+
+        Args:
+            query: Bazel query expression (e.g., "//..." or "deps(//pkg:target)")
+
+        Returns:
+            Query results or error message
+        """
+        result = tools_executor.bazel_query(query)
+
+        output = []
+        if result['stdout']:
+            output.append(result['stdout'])
+        if result['stderr']:
+            output.append(result['stderr'])
+
+        if result['success']:
+            return "\n".join(output) or "Query succeeded"
+        else:
+            return f"Query failed (exit code {result['exit_code']}):\n" + "\n".join(output)
+
+    return [
+        read_file,
+        write_file,
+        find_replace_in_file,
+        list_directory,
+        find_files,
+        ripgrep,
+        bazel_build,
+        bazel_test,
+        bazel_query,
+    ]
+
+
+# ============================================================================
+# Orchestration V2 (with real LLM integration)
 # ============================================================================
 
 def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
                            attempt_type='implementation', max_tools=50):
     """
-    Simplified V2 orchestration demonstrating the schema integration pattern.
+    V2 orchestration with real LLM integration.
 
-    This is a minimal working example showing how V2 schema integrates with
-    the orchestration layer. It handles:
-    - Branch and worktree creation
-    - Attempt tracking
-    - Tool call recording
-    - Result creation
-    - Validation runs
+    This function:
+    - Creates branch and worktree
+    - Tracks attempt in V2 schema
+    - Calls real LLM with tools
+    - Records tool calls
+    - Runs validation
+    - Creates attempt result
 
     Args:
         db: Database connection
@@ -1066,9 +1420,20 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
         )
         logging.info(f"[V2] Created branch: {branch_name}")
 
-    # Create worktree (in practice, we'd actually create a git worktree)
-    # For this demo, we just track it in the database
-    worktree_path = f"{repo_path}/worktrees/goal-{goal_id}-attempt"
+    # Create worktree path
+    worktree_path = f"{repo_path}/worktrees/goal-{goal_id}-attempt-{int(time.time())}"
+
+    # Actually create git worktree
+    os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
+    subprocess.run(
+        ['git', 'worktree', 'add', worktree_path, current_sha],
+        cwd=repo_path,
+        check=True,
+        capture_output=True
+    )
+    logging.info(f"[V2] Created git worktree: {worktree_path}")
+
+    # Track worktree in database
     worktree_id = create_worktree_v2(
         db,
         branch_id=branch_id,
@@ -1076,7 +1441,6 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
         start_sha=current_sha,
         reason=f"Attempt for goal {goal_id}"
     )
-    logging.info(f"[V2] Created worktree: {worktree_path}")
 
     # Create attempt
     prompt = f"Goal: {goal['goal_text']}\n\nPlease complete this goal."
@@ -1091,54 +1455,134 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
     )
     logging.info(f"[V2] Created attempt {attempt_id} with {model_id}")
 
-    # Get tools for this session
-    tools = get_tools_for_session_v2(db, session_id)
-
-    # Link tools to attempt
-    for tool in tools:
+    # Get tools for this session and link to attempt
+    tools_list = get_tools_for_session_v2(db, session_id)
+    tool_id_map = {}  # Map tool names to IDs for recording
+    for tool in tools_list:
         create_attempt_tool_v2(db, attempt_id, tool['id'])
-    logging.debug(f"[V2] Linked {len(tools)} tools to attempt")
+        tool_id_map[tool['name']] = tool['id']
+    logging.debug(f"[V2] Linked {len(tools_list)} tools to attempt")
 
-    # Simulate LLM execution with tool calls
-    # In real implementation, this would invoke LLM and record actual tool calls
-    # For demo, we'll simulate a few tool calls
-    simulated_tool_calls = [
-        {'tool': tools[0], 'input': '{"path": "README.md"}', 'output': 'file contents'},
-        {'tool': tools[0], 'input': '{"path": "BUILD"}', 'output': 'build file'},
-    ] if tools else []
+    # Initialize tool executor and create tool functions
+    tools_executor = WorktreeToolExecutor(worktree_path)
+    tool_functions = create_v2_tool_functions(tools_executor)
 
-    for i, call_data in enumerate(simulated_tool_calls, 1):
-        create_tool_call_v2(
-            db,
-            attempt_id=attempt_id,
-            order_num=i,
-            tool_id=call_data['tool']['id'],
-            tool_name=call_data['tool']['name'],
-            input_data=call_data['input'],
-            output=call_data['output']
+    # Track tool calls and activity
+    tool_calls_made = []
+    last_activity_time = [time.time()]
+
+    def after_call(tool, tool_call, tool_result):
+        """Record each tool call"""
+        # Check timeout (2 minutes)
+        elapsed = time.time() - last_activity_time[0]
+        if elapsed > 120:
+            logging.error(f"[V2 Attempt {attempt_id}] Timeout: No activity for {elapsed:.1f}s")
+            raise LLMTimeoutError(f"No activity for {elapsed:.1f}s (timeout: 120s)")
+
+        last_activity_time[0] = time.time()
+
+        # Get tool name
+        tool_name = getattr(tool, "name", getattr(tool, "__name__", "unknown"))
+
+        # Log
+        args_str = str(tool_call.arguments)[:100]
+        logging.info(f"[V2]   Tool {len(tool_calls_made)+1}/{max_tools}: {tool_name}({args_str})")
+
+        # Record tool call
+        tool_id = tool_id_map.get(tool_name)
+        if tool_id:
+            create_tool_call_v2(
+                db, attempt_id, len(tool_calls_made) + 1, tool_id, tool_name,
+                input_data=json.dumps(tool_call.arguments),
+                output=str(tool_result.output)
+            )
+
+        tool_calls_made.append({'name': tool_name, 'args': tool_call.arguments})
+
+        # Check tool limit
+        if len(tool_calls_made) >= max_tools:
+            logging.warning(f"[V2 Attempt {attempt_id}] Tool limit ({max_tools}) reached")
+            raise ToolLimitExceeded(f"Tool limit of {max_tools} exceeded")
+
+    try:
+        # Call LLM with tools
+        logging.info(f"[V2] Calling LLM {model_id}...")
+        model = llm.get_model(model_id)
+
+        system_prompt = f"""You are an autonomous coding agent working on a specific goal in a git repository.
+
+You have access to tools to read files, search code, modify files, and run Bazel commands.
+
+**Important constraints:**
+- You have {max_tools} tool calls to achieve this goal
+- Use tools efficiently to stay within the limit
+- For Bazel projects: use MODULE.bazel with bzlmod, NOT WORKSPACE files
+
+Your task is to work towards achieving the goal. You should:
+1. Explore the repository to understand its structure
+2. Make necessary changes to achieve the goal
+3. Test your changes using Bazel build/test commands when appropriate
+4. Be methodical and explain your reasoning
+
+When you have successfully achieved the goal (or determined it cannot be achieved), explain your final status clearly."""
+
+        chain = model.chain(
+            goal['goal_text'],
+            system=system_prompt,
+            tools=tool_functions,
+            after_call=after_call
         )
-        if i >= max_tools:
-            logging.warning(f"[V2] Reached max_tools limit: {max_tools}")
-            break
 
-    logging.info(f"[V2] Recorded {len(simulated_tool_calls)} tool calls")
+        response_text = chain.text()
+        logging.info(f"[V2] LLM completed - {len(tool_calls_made)} tools used")
 
-    # Simulate getting final SHA (in real implementation, from git)
-    end_sha = current_sha  # In demo, same as start
-    diff = "mock diff"
+        # Determine outcome
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        end_sha = result.stdout.strip()
 
-    # Determine status (for demo, we'll say success)
-    status = "success"
-    status_detail = None
+        # Get diff
+        diff_result = subprocess.run(
+            ['git', 'diff', current_sha, end_sha],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True
+        )
+        diff = diff_result.stdout
+
+        # Check if changes were made
+        has_changes = (end_sha != current_sha) or bool(diff)
+
+        status = "completed"  # LLM finished
+        status_detail = f"Used {len(tool_calls_made)} tools"
+
+    except LLMTimeoutError as e:
+        logging.error(f"[V2] Timeout: {e}")
+        end_sha = current_sha
+        diff = ""
+        status = "timeout"
+        status_detail = str(e)
+    except ToolLimitExceeded as e:
+        logging.error(f"[V2] Tool limit exceeded: {e}")
+        end_sha = current_sha
+        diff = ""
+        status = "tool_limit"
+        status_detail = str(e)
+    except Exception as e:
+        logging.error(f"[V2] Error: {e}")
+        end_sha = current_sha
+        diff = ""
+        status = "error"
+        status_detail = str(e)
 
     # Create attempt result
     result_id = create_attempt_result_v2(
-        db,
-        attempt_id=attempt_id,
-        end_commit_sha=end_sha,
-        diff=diff,
-        status=status,
-        status_detail=status_detail
+        db, attempt_id, end_sha, diff, status, status_detail
     )
     logging.info(f"[V2] Created attempt result {result_id}: {status}")
 
@@ -1151,32 +1595,41 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
         all_passed = True
 
         for step in validation_steps:
-            # In real implementation, would execute the command
-            # For demo, simulate exit code
-            exit_code = 0  # Simulate success
-            output = f"Simulated output for: {step['command']}"
+            # Execute validation command
+            val_result = subprocess.run(
+                step['command'],
+                cwd=worktree_path,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
 
             create_validation_run_v2(
                 db,
                 validation_step_id=step['id'],
                 attempt_result_id=result_id,
-                exit_code=exit_code,
-                output=output
+                exit_code=val_result.returncode,
+                output=val_result.stdout + val_result.stderr
             )
 
-            if exit_code != 0:
+            if val_result.returncode != 0:
                 all_passed = False
+                logging.warning(f"[V2]   Validation FAILED: {step['command']}")
+            else:
+                logging.info(f"[V2]   Validation passed: {step['command']}")
 
         validation_passed = all_passed
         logging.info(f"[V2] Validation: {'PASSED' if validation_passed else 'FAILED'}")
 
-    success = (status == "success") and (validation_passed is not False)
+    success = (status == "success" or status == "completed") and (validation_passed is not False)
 
     return {
         'success': success,
         'attempt_id': attempt_id,
         'result_id': result_id,
-        'validation_passed': validation_passed
+        'validation_passed': validation_passed,
+        'worktree_path': worktree_path
     }
 
 
@@ -3450,6 +3903,16 @@ def main():
         action='store_true',
         help='Enable verbose (DEBUG) logging'
     )
+    parser.add_argument(
+        '--use-v2',
+        action='store_true',
+        help='Use V2 schema and orchestration (experimental)'
+    )
+    parser.add_argument(
+        '--validation',
+        action='append',
+        help='Validation command(s) to run (can be specified multiple times)'
+    )
 
     args = parser.parse_args()
 
@@ -3493,6 +3956,147 @@ def main():
     except ValueError as e:
         logging.error(str(e))
         sys.exit(1)
+
+    # ========================================================================
+    # V2 Execution Path
+    # ========================================================================
+    if args.use_v2:
+        logging.info("=" * 80)
+        logging.info("Using V2 schema and orchestration")
+        logging.info("=" * 80)
+
+        # Create V2 database
+        db_path = f"shots-on-goal-v2-{int(time.time())}.db"
+        db = init_database_v2(db_path)
+        logging.info(f"Created V2 database: {db_path}")
+
+        # Create V2 session
+        session_id = create_session_v2(
+            db,
+            initial_goal=args.goal,
+            model_a=args.model_a,
+            model_b=args.model_b,
+            flags={'max_tools': args.max_tools, 'max_decompositions': args.max_decompositions},
+            repo_path=str(repo_path),
+            base_branch=base_branch
+        )
+        logging.info(f"Created V2 session (ID: {session_id})")
+
+        # Create tools in V2 schema
+        tool_definitions = [
+            ('read_file', 'Read a file from the workspace'),
+            ('write_file', 'Write content to a file'),
+            ('find_replace_in_file', 'Find and replace text in a file'),
+            ('list_directory', 'List files in a directory'),
+            ('find_files', 'Find files by name pattern'),
+            ('ripgrep', 'Search code using ripgrep'),
+            ('bazel_build', 'Build Bazel targets'),
+            ('bazel_test', 'Run Bazel tests'),
+            ('bazel_query', 'Query the Bazel build graph'),
+        ]
+
+        for name, description in tool_definitions:
+            create_tool_v2(db, session_id, name, description)
+        logging.info(f"Created {len(tool_definitions)} tools")
+
+        # Create root goal with validation commands
+        root_goal_id = create_goal_v2(
+            db,
+            session_id=session_id,
+            goal_text=args.goal,
+            source='cli'
+        )
+        logging.info(f"Created root goal (ID: {root_goal_id}): {args.goal}")
+
+        # Add validation steps if provided
+        if args.validation:
+            for i, val_cmd in enumerate(args.validation, 1):
+                create_validation_step_v2(
+                    db,
+                    goal_id=root_goal_id,
+                    order_num=i,
+                    command=val_cmd,
+                    source='cli'
+                )
+            logging.info(f"Added {len(args.validation)} validation steps")
+
+        # Start working on the root goal
+        logging.info("=" * 80)
+        logging.info("Starting work on goal with V2 orchestration...")
+        logging.info("=" * 80)
+
+        try:
+            success = work_on_goal_v2_recursive(
+                db=db,
+                session_id=session_id,
+                goal_id=root_goal_id,
+                repo_path=str(repo_path),
+                model_a=args.model_a,
+                model_b=args.model_b,
+                max_decompositions=args.max_decompositions,
+                max_depth=5
+            )
+
+            logging.info("=" * 80)
+            logging.info("Goal tree completed!")
+            logging.info("=" * 80)
+
+            # Get final status
+            final_goal = get_goal_v2(db, root_goal_id)
+            if success:
+                logging.info("✓ Root goal completed successfully!")
+            else:
+                logging.info("✗ Root goal did not complete successfully")
+
+            # Show goal tree summary
+            logging.info("")
+            logging.info("--- Goal Tree Summary (V2) ---")
+            tree = get_goal_tree_v2(db, root_goal_id)
+
+            def print_tree(node, depth=0):
+                indent = "  " * depth
+                goal = node['goal']
+                attempts = node.get('attempts', [])
+                status_icon = "•"
+                logging.info(f"{indent}{status_icon} Goal {goal['id']}: {goal['goal_text'][:60]}")
+                logging.info(f"{indent}  Attempts: {len(attempts)}")
+                for child in node.get('children', []):
+                    print_tree(child, depth + 1)
+
+            print_tree(tree)
+
+            # Show attempts
+            logging.info("")
+            logging.info("--- Attempts (V2) ---")
+            all_attempts = db.execute("""
+                SELECT a.id, a.goal_id, a.model, a.attempt_type,
+                       ar.status, w.path as worktree_path
+                FROM attempt a
+                LEFT JOIN attempt_result ar ON ar.attempt_id = a.id
+                LEFT JOIN worktree w ON w.id = a.worktree_id
+                ORDER BY a.id
+            """).fetchall()
+
+            for attempt in all_attempts:
+                status_icon = "✓" if attempt['status'] == 'success' else "✗"
+                logging.info(f"{status_icon} Attempt {attempt['id']} (Goal {attempt['goal_id']}, {attempt['model']}, {attempt['attempt_type']}): {attempt['status']}")
+                if attempt['worktree_path']:
+                    logging.info(f"    Worktree: {attempt['worktree_path']}")
+
+        except KeyboardInterrupt:
+            logging.info("")
+            logging.info("Interrupted by user. Database saved.")
+        except Exception as e:
+            logging.error(f"Error during execution: {e}")
+            raise
+        finally:
+            db.close()
+
+        return
+
+    # ========================================================================
+    # V1 Execution Path (original)
+    # ========================================================================
 
     # Create new session
     session_dir, db = create_session(args.goal, str(repo_path), base_branch)
