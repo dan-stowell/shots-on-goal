@@ -15,7 +15,6 @@ from datetime import datetime
 from pathlib import Path
 import json
 import logging
-import random
 import time
 import llm
 from llm.utils import extract_fenced_code_block
@@ -1192,7 +1191,7 @@ class ToolLimitExceeded(Exception):
 
 
 def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="container",
-                 model_id="openrouter/anthropic/claude-haiku-4.5", system_prompt=None, max_tools=20,
+                 model_id="openrouter/anthropic/claude-haiku-4.5", system_prompt=None, max_tools=50,
                  goal_working_branch=None, previous_attempts=None, merge_target_branch=None):
     """
     Work on a goal using an LLM agent with tool access.
@@ -1205,7 +1204,7 @@ def work_on_goal(db, goal_id, repo_path, image="shots-on-goal:latest", runtime="
         runtime: Container runtime ('container' or 'docker')
         model_id: LLM model to use (default: openrouter/anthropic/claude-haiku-4.5)
         system_prompt: Optional system prompt for the LLM
-        max_tools: Maximum number of tool calls allowed (default: 20)
+        max_tools: Maximum number of tool calls allowed (default: 50)
         goal_working_branch: Branch to base the attempt on (if None, uses session base_branch)
         previous_attempts: List of previous attempt results (for feedback loop)
         merge_target_branch: Branch to merge into on success (if None, uses goal_working_branch)
@@ -1716,11 +1715,12 @@ Return ONLY valid JSON (you can wrap in ```json if you want):
 # Work Orchestration
 # ============================================================================
 
-def work_on_goal_with_tournament(db, goal_id, repo_path, image, runtime, model_pool,
-                                current_champion, goal_working_branch, depth=0):
+def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_a, model_b,
+                          max_tools=50, max_decompositions=5, depth=0, max_depth=5,
+                          parent_working_branch=None, current_model=None,
+                          decomposition_count=0):
     """
-    Run tournament-style parallel attempts with 2 models competing.
-    Winner (fastest to succeed) continues as champion.
+    Work on a goal recursively with ping-pong model alternation.
 
     Args:
         db: Database connection
@@ -1728,121 +1728,18 @@ def work_on_goal_with_tournament(db, goal_id, repo_path, image, runtime, model_p
         repo_path: Path to repository
         image: Container image
         runtime: Container runtime
-        model_pool: List of model IDs to choose from
-        current_champion: Current champion model (or None for first goal)
-        goal_working_branch: Branch to base attempts on and merge into
-        depth: Current recursion depth (for logging)
-
-    Returns:
-        dict with 'success' (bool), 'winner_model' (str or None), 'result' (attempt result dict)
-    """
-    indent = "  " * depth
-
-    # Pick 2 models for the tournament
-    if current_champion and current_champion in model_pool:
-        # Champion vs random challenger
-        available = [m for m in model_pool if m != current_champion]
-        if available:
-            challenger = random.choice(available)
-            model_a, model_b = current_champion, challenger
-            logging.info(f"{indent}[Goal {goal_id}] Tournament: Champion {shorten_model_name(model_a)} vs {shorten_model_name(model_b)}")
-        else:
-            # Only one model in pool
-            model_a, model_b = current_champion, current_champion
-            logging.info(f"{indent}[Goal {goal_id}] Single model: {shorten_model_name(model_a)}")
-    else:
-        # No champion or champion not in pool - pick 2 random
-        if len(model_pool) >= 2:
-            model_a, model_b = random.sample(model_pool, 2)
-            logging.info(f"{indent}[Goal {goal_id}] Tournament: {shorten_model_name(model_a)} vs {shorten_model_name(model_b)}")
-        elif len(model_pool) == 1:
-            model_a = model_b = model_pool[0]
-            logging.info(f"{indent}[Goal {goal_id}] Single model: {shorten_model_name(model_a)}")
-        else:
-            logging.error(f"{indent}[Goal {goal_id}] No models in pool!")
-            return {'success': False, 'winner_model': None, 'result': None}
-
-    # Run first model (champion or randomly chosen)
-    winner_model = None
-    winner_result = None
-
-    logging.info(f"{indent}[Goal {goal_id}]   Running {shorten_model_name(model_a)}...")
-    start_time = time.time()
-    result_a = work_on_goal(
-        db=db,
-        goal_id=goal_id,
-        repo_path=repo_path,
-        image=image,
-        runtime=runtime,
-        model_id=model_a,
-        goal_working_branch=goal_working_branch,
-        merge_target_branch=goal_working_branch
-    )
-    elapsed_a = time.time() - start_time
-
-    if result_a['outcome'] == 'success':
-        # First model succeeded - it wins!
-        winner_model = model_a
-        winner_result = result_a
-        logging.info(f"{indent}[Goal {goal_id}] ✓ {shorten_model_name(model_a)} succeeded in {elapsed_a:.1f}s")
-        logging.info(f"{indent}[Goal {goal_id}] 🏆 {shorten_model_name(model_a)} WINS!")
-    else:
-        # First model failed
-        logging.info(f"{indent}[Goal {goal_id}] ✗ {shorten_model_name(model_a)} failed: {result_a['outcome']} (took {elapsed_a:.1f}s)")
-
-        # Only run second model if it's different from first
-        if model_a != model_b:
-            logging.info(f"{indent}[Goal {goal_id}]   Running {shorten_model_name(model_b)}...")
-            start_time = time.time()
-            result_b = work_on_goal(
-                db=db,
-                goal_id=goal_id,
-                repo_path=repo_path,
-                image=image,
-                runtime=runtime,
-                model_id=model_b,
-                goal_working_branch=goal_working_branch,
-                merge_target_branch=goal_working_branch
-            )
-            elapsed_b = time.time() - start_time
-
-            if result_b['outcome'] == 'success':
-                # Second model succeeded!
-                winner_model = model_b
-                winner_result = result_b
-                logging.info(f"{indent}[Goal {goal_id}] ✓ {shorten_model_name(model_b)} succeeded in {elapsed_b:.1f}s")
-                logging.info(f"{indent}[Goal {goal_id}] 🏆 {shorten_model_name(model_b)} WINS!")
-            else:
-                # Second model also failed
-                logging.info(f"{indent}[Goal {goal_id}] ✗ {shorten_model_name(model_b)} failed: {result_b['outcome']} (took {elapsed_b:.1f}s)")
-                logging.info(f"{indent}[Goal {goal_id}] Both models failed")
-
-    return {
-        'success': winner_model is not None,
-        'winner_model': winner_model,
-        'result': winner_result
-    }
-
-
-def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_pool, depth=0, max_depth=5,
-                          parent_working_branch=None, current_champion=None):
-    """
-    Work on a goal recursively with tournament-style model competition.
-
-    Args:
-        db: Database connection
-        goal_id: Goal ID to work on
-        repo_path: Path to repository
-        image: Container image
-        runtime: Container runtime
-        model_pool: List of model IDs to choose from
+        model_a: First model ID
+        model_b: Second model ID
+        max_tools: Maximum tool calls per attempt
+        max_decompositions: Maximum number of decompositions before giving up
         depth: Current recursion depth
         max_depth: Maximum recursion depth
         parent_working_branch: Parent goal's working branch (None for root goal)
-        current_champion: Current champion model (winner from previous goal)
+        current_model: Which model should attempt this goal (None = start with A)
+        decomposition_count: How many decompositions have occurred so far
 
     Returns:
-        tuple: (success: bool, champion: str or None)
+        bool: True if goal completed successfully
     """
     indent = "  " * depth
     goal = get_goal(db, goal_id)
@@ -1850,11 +1747,17 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_pool, d
 
     logging.info(f"{indent}[Goal {goal_id}] Working on: {goal_desc}")
 
+    # Check decomposition limit
+    if decomposition_count >= max_decompositions:
+        logging.warning(f"{indent}[Goal {goal_id}] Max decompositions ({max_decompositions}) reached - marking as failed")
+        update_goal_status(db, goal_id, 'failed')
+        return False
+
     # Check depth limit
     if depth >= max_depth:
         logging.warning(f"{indent}[Goal {goal_id}] Max depth ({max_depth}) reached - marking as failed")
         update_goal_status(db, goal_id, 'failed')
-        return False, None
+        return False
 
     # Create or get goal's working branch
     git_manager = GitManager(os.path.abspath(repo_path))
@@ -1898,72 +1801,71 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_pool, d
     if goal['status'] != 'in_progress':
         update_goal_status(db, goal_id, 'in_progress')
 
-    # Run tournament: 2 models compete in parallel
-    tournament_result = work_on_goal_with_tournament(
+    # Determine which model to use (default to A if not specified)
+    if current_model is None:
+        model_to_use = model_a
+        other_model = model_b
+    else:
+        model_to_use = current_model
+        other_model = model_b if current_model == model_a else model_a
+
+    logging.info(f"{indent}[Goal {goal_id}] {shorten_model_name(model_to_use)} attempting...")
+
+    # Single attempt with current model
+    start_time = time.time()
+    result = work_on_goal(
         db=db,
         goal_id=goal_id,
         repo_path=repo_path,
         image=image,
         runtime=runtime,
-        model_pool=model_pool,
-        current_champion=current_champion,
+        model_id=model_to_use,
+        max_tools=max_tools,
         goal_working_branch=goal_working_branch,
-        depth=depth
+        merge_target_branch=goal_working_branch
     )
+    elapsed = time.time() - start_time
 
     # Handle the outcome
-    if tournament_result['success']:
-        winner = tournament_result['winner_model']
-        logging.info(f"{indent}[Goal {goal_id}] ✓ Completed successfully - {shorten_model_name(winner)} wins!")
+    if result['outcome'] == 'success':
+        logging.info(f"{indent}[Goal {goal_id}] ✓ {shorten_model_name(model_to_use)} succeeded in {elapsed:.1f}s!")
         update_goal_status(db, goal_id, 'completed')
-        return True, winner  # Return success and the winning model
+        return True
     else:
-        logging.info(f"{indent}[Goal {goal_id}] Tournament failed - both models unsuccessful")
+        logging.info(f"{indent}[Goal {goal_id}] ✗ {shorten_model_name(model_to_use)} failed: {result['outcome']} (took {elapsed:.1f}s)")
 
-    # Tournament failed - check if we should decompose
-    # Only decompose root goals (goals without parents)
-    # Sub-goals that fail should not be decomposed further
-    if goal['parent_id'] is None:
-            # Root goal - decompose and work on sub-goals
-            logging.info(f"{indent}[Goal {goal_id}] Tournament failed - decomposing...")
+    # Failed - decompose with other model
+    logging.info(f"{indent}[Goal {goal_id}] Flipping to {shorten_model_name(other_model)} for decomposition...")
 
-            # Use one of the models from pool for decomposition
-            decomp_model = model_pool[0] if model_pool else 'openrouter/anthropic/claude-haiku-4.5'
-            sub_goal_ids = decompose_goal(db, goal_id, [], model_id=decomp_model)
+    sub_goal_ids = decompose_goal(db, goal_id, [result], model_id=other_model)
 
-            if not sub_goal_ids:
-                logging.warning(f"{indent}[Goal {goal_id}] No sub-goals created - marking as failed")
-                update_goal_status(db, goal_id, 'failed')
-                return False, None
-    else:
-        # Sub-goal failed - don't decompose further, just fail
-        logging.warning(f"{indent}[Goal {goal_id}] Sub-goal tournament failed")
-        logging.warning(f"{indent}[Goal {goal_id}] Not decomposing (sub-goals don't decompose) - marking as failed")
+    if not sub_goal_ids:
+        logging.warning(f"{indent}[Goal {goal_id}] No sub-goals created - marking as failed")
         update_goal_status(db, goal_id, 'failed')
-        return False, None
+        return False
 
-    # Work on each sub-goal sequentially
-    # Each sub-goal branches from parent's working branch,
-    # and successful attempts are merged back into it
+    # Work on each sub-goal sequentially with the decomposing model
     # STOP on first failure (fail-fast)
-    # Champion from parent goal gets to compete in first sub-goal
     all_succeeded = True
-    subgoal_champion = current_champion  # Start with parent's champion
 
     for i, sub_goal_id in enumerate(sub_goal_ids, 1):
         logging.info(f"{indent}[Goal {goal_id}] Working on sub-goal {i}/{len(sub_goal_ids)}")
 
-        success, subgoal_champion = work_on_goal_recursive(
+        success = work_on_goal_recursive(
             db=db,
             goal_id=sub_goal_id,
             repo_path=repo_path,
             image=image,
             runtime=runtime,
-            model_pool=model_pool,
+            model_a=model_a,
+            model_b=model_b,
+            max_tools=max_tools,
+            max_decompositions=max_decompositions,
             depth=depth + 1,
             max_depth=max_depth,
             parent_working_branch=goal_working_branch,  # Sub-goals build on parent's branch
-            current_champion=subgoal_champion  # Pass champion from previous sub-goal
+            current_model=other_model,  # The model that decomposed works on sub-goals
+            decomposition_count=decomposition_count + 1  # Increment decomposition count
         )
 
         if not success:
@@ -1972,18 +1874,16 @@ def work_on_goal_recursive(db, goal_id, repo_path, image, runtime, model_pool, d
             break  # Fail fast - don't process remaining sub-goals
         else:
             logging.info(f"{indent}[Goal {goal_id}] Sub-goal {sub_goal_id} succeeded - changes merged into {goal_working_branch}")
-            if subgoal_champion:
-                logging.info(f"{indent}[Goal {goal_id}]   Champion: {shorten_model_name(subgoal_champion)}")
 
     # Update parent goal status based on sub-goals
     if all_succeeded:
         logging.info(f"{indent}[Goal {goal_id}] ✓ All sub-goals completed - marking as completed")
         update_goal_status(db, goal_id, 'completed')
-        return True, subgoal_champion  # Return the final champion
+        return True
     else:
         logging.warning(f"{indent}[Goal {goal_id}] ✗ Some sub-goals failed - marking as failed")
         update_goal_status(db, goal_id, 'failed')
-        return False, None
+        return False
 
 
 # ============================================================================
@@ -2118,26 +2018,31 @@ def main():
 
     # Configuration options
     parser.add_argument(
-        '--model-pool',
-        nargs='+',
-        default=[
-            'openrouter/x-ai/grok-code-fast-1',
-            'openrouter/anthropic/claude-sonnet-4.5',
-            'openrouter/anthropic/claude-haiku-4.5',
-            'openrouter/google/gemini-2.5-flash',
-            'openrouter/x-ai/grok-4-fast',
-            'openrouter/google/gemini-2.5-pro',
-            'openrouter/z-ai/glm-4.6',
-            'openrouter/qwen/qwen3-coder-30b-a3b-instruct',
-            'openrouter/openai/gpt-5',
-            'openrouter/openai/gpt-5-codex',
-        ],
-        help='LLM models to use in tournament (default: 10 diverse models including Grok, Claude, Gemini, GPT-5, etc.)'
+        '--model-a',
+        default='openrouter/anthropic/claude-sonnet-4.5',
+        help='First model for collaborative peer review (default: claude-sonnet-4.5)'
+    )
+    parser.add_argument(
+        '--model-b',
+        default='openrouter/openai/gpt-5-codex',
+        help='Second model for collaborative peer review (default: gpt-5-codex)'
     )
     parser.add_argument(
         '--image',
         default='shots-on-goal:latest',
         help='Container image to use (default: shots-on-goal:latest)'
+    )
+    parser.add_argument(
+        '--max-tools',
+        type=int,
+        default=50,
+        help='Maximum number of tool calls per attempt (default: 50)'
+    )
+    parser.add_argument(
+        '--max-decompositions',
+        type=int,
+        default=5,
+        help='Maximum number of decompositions before giving up (default: 5)'
     )
     parser.add_argument(
         '--verbose',
@@ -2195,13 +2100,16 @@ def main():
     logging.info("=" * 80)
 
     try:
-        success, final_champion = work_on_goal_recursive(
+        success = work_on_goal_recursive(
             db=db,
             goal_id=root_goal_id,
             repo_path=str(repo_path),
             image=args.image,
             runtime=detect_container_runtime(),
-            model_pool=args.model_pool
+            model_a=args.model_a,
+            model_b=args.model_b,
+            max_tools=args.max_tools,
+            max_decompositions=args.max_decompositions
         )
 
         logging.info("=" * 80)
@@ -2214,8 +2122,6 @@ def main():
 
         if success:
             logging.info("✓ Root goal completed successfully!")
-            if final_champion:
-                logging.info(f"  Final champion: {final_champion}")
         else:
             logging.info("✗ Root goal did not complete successfully")
 
