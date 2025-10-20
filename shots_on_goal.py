@@ -1090,12 +1090,13 @@ def create_v2_tool_functions(tools_executor):
         List of tool functions with docstrings
     """
 
-    def read_file(path: str) -> str:
+    def read_file(path: str, reason: str = None) -> str:
         """
         Read a file from the workspace.
 
         Args:
             path: Path to file relative to workspace root
+            reason: Optional reason for reading this file
 
         Returns:
             File contents as a string
@@ -1106,12 +1107,13 @@ def create_v2_tool_functions(tools_executor):
         else:
             return f"ERROR: {result['error']}"
 
-    def read_multiple_files(paths: list) -> str:
+    def read_multiple_files(paths: list, reason: str = None) -> str:
         """
         Read multiple files at once (more efficient than calling read_file multiple times).
 
         Args:
             paths: List of file paths relative to workspace root
+            reason: Optional reason for reading these files
 
         Returns:
             Formatted string with contents of each file, separated by headers
@@ -1125,13 +1127,14 @@ def create_v2_tool_functions(tools_executor):
                 output.append(f"=== {path} ===\nERROR: {result['error']}")
         return "\n\n".join(output) if output else "No files read"
 
-    def write_file(path: str, content: str) -> str:
+    def write_file(path: str, content: str, reason: str = None) -> str:
         """
         Write content to a file in the workspace.
 
         Args:
             path: Path to file relative to workspace root
             content: Content to write to the file
+            reason: Optional reason for writing this file
 
         Returns:
             Success message or error
@@ -1142,13 +1145,14 @@ def create_v2_tool_functions(tools_executor):
         else:
             return f"ERROR: {result['error']}"
 
-    def write_multiple_files(files: dict) -> str:
+    def write_multiple_files(files: dict, reason: str = None) -> str:
         """
         Write multiple files at once (more efficient than calling write_file multiple times).
 
         Args:
             files: Dict mapping file paths to content strings
                    Example: {"src/foo.py": "content1", "src/bar.py": "content2"}
+            reason: Optional reason for writing these files
 
         Returns:
             Summary of files written or errors
@@ -1168,7 +1172,7 @@ def create_v2_tool_functions(tools_executor):
             return f"{summary}\n" + "\n".join(output)
         return summary
 
-    def find_replace_in_file(path: str, old_text: str, new_text: str) -> str:
+    def find_replace_in_file(path: str, old_text: str, new_text: str, reason: str = None) -> str:
         """
         Find and replace text in a file. Requires exactly one match.
 
@@ -1176,6 +1180,7 @@ def create_v2_tool_functions(tools_executor):
             path: Path to file relative to workspace root
             old_text: Text to find (must match exactly once)
             new_text: Text to replace with
+            reason: Optional reason for this replacement
 
         Returns:
             Success message or error
@@ -1186,12 +1191,13 @@ def create_v2_tool_functions(tools_executor):
         else:
             return f"ERROR: {result['error']}"
 
-    def list_directory(path: str = ".") -> str:
+    def list_directory(path: str = ".", reason: str = None) -> str:
         """
         List files in a directory.
 
         Args:
             path: Directory path (default: current directory)
+            reason: Optional reason for listing this directory
 
         Returns:
             Newline-separated list of files
@@ -1202,13 +1208,14 @@ def create_v2_tool_functions(tools_executor):
         else:
             return f"ERROR: {result['error']}"
 
-    def find_files(pattern: str, path: str = ".") -> str:
+    def find_files(pattern: str, path: str = ".", reason: str = None) -> str:
         """
         Find files by name pattern.
 
         Args:
             pattern: Filename pattern (glob style, e.g., "*.py" or "BUILD*")
             path: Path to search in (default: current directory)
+            reason: Optional reason for finding these files
 
         Returns:
             Newline-separated list of matching file paths
@@ -1219,7 +1226,7 @@ def create_v2_tool_functions(tools_executor):
         else:
             return f"ERROR: {result['error']}"
 
-    def ripgrep(pattern: str, path: str = ".", glob: str = None, ignore_case: bool = False) -> str:
+    def ripgrep(pattern: str, path: str = ".", glob: str = None, ignore_case: bool = False, reason: str = None) -> str:
         """
         Search code using ripgrep.
 
@@ -1228,6 +1235,7 @@ def create_v2_tool_functions(tools_executor):
             path: Path to search in (default: current directory)
             glob: Optional glob pattern to filter files (e.g., "*.py")
             ignore_case: Case-insensitive search (default: false)
+            reason: Optional reason for this search
 
         Returns:
             Search results in JSON format
@@ -1238,13 +1246,14 @@ def create_v2_tool_functions(tools_executor):
         else:
             return f"ERROR: {result['stderr']}"
 
-    def bazel_build(targets: str = "//...", flags: str = None) -> str:
+    def bazel_build(targets: str = "//...", flags: str = None, reason: str = None) -> str:
         """
         Build Bazel targets.
 
         Args:
             targets: Bazel target pattern (default: //...)
             flags: Optional space-separated bazel flags
+            reason: Optional reason for this build
 
         Returns:
             Build output or error message
@@ -1263,13 +1272,14 @@ def create_v2_tool_functions(tools_executor):
         else:
             return f"Build failed (exit code {result['exit_code']}):\n" + "\n".join(output)
 
-    def bazel_test(targets: str = "//...", flags: str = None) -> str:
+    def bazel_test(targets: str = "//...", flags: str = None, reason: str = None) -> str:
         """
         Run Bazel tests.
 
         Args:
             targets: Bazel test target pattern (default: //...)
             flags: Optional space-separated bazel flags
+            reason: Optional reason for running these tests
 
         Returns:
             Test output or error message
@@ -1288,12 +1298,13 @@ def create_v2_tool_functions(tools_executor):
         else:
             return f"Tests failed (exit code {result['exit_code']}):\n" + "\n".join(output)
 
-    def bazel_query(query: str) -> str:
+    def bazel_query(query: str, reason: str = None) -> str:
         """
         Query the Bazel build graph.
 
         Args:
             query: Bazel query expression (e.g., "//..." or "deps(//pkg:target)")
+            reason: Optional reason for this query
 
         Returns:
             Query results or error message
@@ -1521,9 +1532,12 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
             # Get tool name
             tool_name = getattr(tool, "name", getattr(tool, "__name__", "unknown"))
 
-            # Log
-            args_str = str(tool_call.arguments)[:100]
-            logging.info(f"  Tool {len(tool_calls_made)+1}/{max_tools}: {tool_name}({args_str})")
+            # Log with reason if provided
+            args = tool_call.arguments
+            reason = args.get('reason', '') if isinstance(args, dict) else ''
+            reason_str = f" - {reason[:50]}" if reason else ""
+            args_str = str(args)[:100]
+            logging.info(f"  Tool {len(tool_calls_made)+1}/{max_tools}: {tool_name}({args_str}){reason_str}")
 
             # Record tool call
             tool_id = tool_id_map.get(tool_name)
@@ -2327,7 +2341,7 @@ def create_tool_functions(tools_executor):
             return f"{summary}\n" + "\n".join(output)
         return summary
 
-    def find_replace_in_file(path: str, old_text: str, new_text: str) -> str:
+    def find_replace_in_file(path: str, old_text: str, new_text: str, reason: str = None) -> str:
         """
         Find and replace text in a file. Requires exactly one match.
 
@@ -2335,6 +2349,7 @@ def create_tool_functions(tools_executor):
             path: Path to file relative to workspace root
             old_text: Text to find (must match exactly once)
             new_text: Text to replace with
+            reason: Optional reason for this replacement
 
         Returns:
             Success message or error
@@ -2345,12 +2360,13 @@ def create_tool_functions(tools_executor):
         else:
             return f"ERROR: {result['error']}"
 
-    def list_directory(path: str = ".") -> str:
+    def list_directory(path: str = ".", reason: str = None) -> str:
         """
         List files in a directory.
 
         Args:
             path: Directory path (default: current directory)
+            reason: Optional reason for listing this directory
 
         Returns:
             Newline-separated list of files
@@ -2361,13 +2377,14 @@ def create_tool_functions(tools_executor):
         else:
             return f"ERROR: {result['error']}"
 
-    def find_files(pattern: str, path: str = ".") -> str:
+    def find_files(pattern: str, path: str = ".", reason: str = None) -> str:
         """
         Find files by name pattern.
 
         Args:
             pattern: Filename pattern (glob style, e.g., "*.py" or "BUILD*")
             path: Path to search in (default: current directory)
+            reason: Optional reason for finding these files
 
         Returns:
             Newline-separated list of matching file paths
@@ -2378,7 +2395,7 @@ def create_tool_functions(tools_executor):
         else:
             return f"ERROR: {result['error']}"
 
-    def ripgrep(pattern: str, path: str = ".", glob: str = None, ignore_case: bool = False) -> str:
+    def ripgrep(pattern: str, path: str = ".", glob: str = None, ignore_case: bool = False, reason: str = None) -> str:
         """
         Search code using ripgrep.
 
@@ -2387,6 +2404,7 @@ def create_tool_functions(tools_executor):
             path: Path to search in (default: current directory)
             glob: Optional glob pattern to filter files (e.g., "*.py")
             ignore_case: Case-insensitive search (default: false)
+            reason: Optional reason for this search
 
         Returns:
             Search results in JSON format
@@ -2397,13 +2415,14 @@ def create_tool_functions(tools_executor):
         else:
             return f"ERROR: {result['stderr']}"
 
-    def bazel_build(targets: str = "//...", flags: str = None) -> str:
+    def bazel_build(targets: str = "//...", flags: str = None, reason: str = None) -> str:
         """
         Build Bazel targets.
 
         Args:
             targets: Bazel target pattern (default: //...)
             flags: Optional space-separated bazel flags
+            reason: Optional reason for this build
 
         Returns:
             Build output or error message
@@ -2422,13 +2441,14 @@ def create_tool_functions(tools_executor):
         else:
             return f"Build failed (exit code {result['exit_code']}):\n" + "\n".join(output)
 
-    def bazel_test(targets: str = "//...", flags: str = None) -> str:
+    def bazel_test(targets: str = "//...", flags: str = None, reason: str = None) -> str:
         """
         Run Bazel tests.
 
         Args:
             targets: Bazel test target pattern (default: //...)
             flags: Optional space-separated bazel flags
+            reason: Optional reason for running these tests
 
         Returns:
             Test output or error message
@@ -2447,12 +2467,13 @@ def create_tool_functions(tools_executor):
         else:
             return f"Tests failed (exit code {result['exit_code']}):\n" + "\n".join(output)
 
-    def bazel_query(query: str) -> str:
+    def bazel_query(query: str, reason: str = None) -> str:
         """
         Query the Bazel build graph.
 
         Args:
             query: Bazel query expression (e.g., "//..." or "deps(//pkg:target)")
+            reason: Optional reason for this query
 
         Returns:
             Query results or error message
