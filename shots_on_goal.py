@@ -1535,8 +1535,15 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
             # Log with reason if provided
             args = tool_call.arguments
             reason = args.get('reason', '') if isinstance(args, dict) else ''
-            reason_str = f" - {reason[:50]}" if reason else ""
-            args_str = str(args)[:100]
+            reason_str = f" - {reason}" if reason else ""
+
+            # Create args string without the reason field
+            if isinstance(args, dict):
+                args_without_reason = {k: v for k, v in args.items() if k != 'reason'}
+                args_str = str(args_without_reason)[:100]
+            else:
+                args_str = str(args)[:100]
+
             logging.info(f"  Tool {len(tool_calls_made)+1}/{max_tools}: {tool_name}({args_str}){reason_str}")
 
             # Record tool call
