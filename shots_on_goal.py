@@ -2523,7 +2523,7 @@ def main():
 
     # Configuration options
     parser.add_argument(
-        '--model-a',
+        '--implementer-model',
         default='openrouter/anthropic/claude-sonnet-4.5',
         help='Model to use for implementation (default: claude-sonnet-4.5)'
     )
@@ -2595,7 +2595,7 @@ def main():
     session_id = create_session_v2(
         db,
         initial_goal=args.goal,
-        model_a=args.model_a,
+        model_a=args.implementer_model,
         model_b='unused',  # Schema requires NOT NULL, but no longer used
         flags={'max_tools': args.max_tools},
         repo_path=str(repo_path),
@@ -2654,7 +2654,7 @@ def main():
             session_id=session_id,
             goal_id=root_goal_id,
             repo_path=str(repo_path),
-            model_id=args.model_a,
+            model_id=args.implementer_model,
             attempt_type='implementation',
             max_tools=args.max_tools,
             image=args.image,

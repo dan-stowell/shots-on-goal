@@ -4,7 +4,7 @@ Shots on Goal is an experimental orchestrator for automating Bazel migrations (a
 
 ## Key capabilities
 
-- **Ping‑pong automation** – Two LLM "teammates" alternate between implementation and decomposition. When one model fails validation, control flips to the other to review the work, create sub‑goals, or repair the failure.
+- **Automated implementation** – An LLM agent works on your goal with access to code editing tools, validation commands, and a generous tool budget.
 - **Structured history** – Every session stores goals, attempts, tool calls, and git metadata in SQLite so you can audit what the agent did or restart from a previous state.
 - **Branch-safe editing** – Each goal and attempt operates on its own git branch/worktree; successful attempts are merged back into the goal branch automatically.
 - **Efficient tooling** – The agent interacts with the repo via a curated toolset (read/write files, batch file operations, `bazel` commands, `ripgrep`, etc.) that runs inside a container for reproducibility.
@@ -67,8 +67,7 @@ The CLI now always uses the V2 schema and containerised tool execution. Launch i
 
 ```bash
 uv run python shots_on_goal.py \
-  --model-a openrouter/anthropic/claude-sonnet-4.5 \
-  --model-b openrouter/openai/gpt-4o \
+  --implementer-model openrouter/anthropic/claude-sonnet-4.5 \
   --max-tools 20 \
   --validation "bazel build //..." \
   --validation "bazel test //..." \
@@ -80,7 +79,7 @@ What happens behind the scenes:
 
 1. A V2 SQLite database (`shots-on-goal-v2-<timestamp>.db`) is created to store sessions, goals, attempts, tool calls, etc.
 2. The repo is checked out onto a dedicated branch/worktree (per session/goal/attempt).
-3. Model A and Model B alternate (`implementation` ↔ `breakdown`) until validations pass or limits are hit.
+3. The implementer model attempts to achieve the goal using available tools within the tool budget.
 4. Each attempt runs tools inside the specified container (`--image`, default `shots-on-goal:latest`).
 5. Validation commands are executed inside the same container; once all pass, the run stops.
 6. All artefacts (attempts, results, validation runs) remain in the V2 database for inspection.
@@ -89,10 +88,9 @@ Commonly used flags:
 
 | Flag | Description |
 | ---- | ----------- |
-| `--model-a`, `--model-b` | Primary & secondary LLM identifiers (OpenRouter IDs) |
+| `--implementer-model` | LLM model identifier for implementation (default: `claude-sonnet-4.5`) |
 | `--image` | Container image used for tool execution (default: `shots-on-goal:latest`) |
 | `--max-tools` | Max tool calls before aborting an attempt (default: 50) |
-| `--max-goal-breakdowns` | Max recursive breakdown depth (default: 5) |
 | `--validation` | Shell command(s) to verify success (can be repeated) |
 | `--verbose`, `-v` | Enable verbose (DEBUG) logging |
 
