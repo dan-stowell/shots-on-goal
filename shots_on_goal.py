@@ -2505,6 +2505,9 @@ def main():
         datefmt='%H:%M:%S'
     )
 
+    # Suppress HTTP request logs from httpx (used by llm library)
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+
     parser = argparse.ArgumentParser(
         description="Shots on Goal - Autonomous goal-driven code migration"
     )
