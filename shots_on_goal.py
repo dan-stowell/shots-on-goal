@@ -2535,8 +2535,8 @@ def main():
     parser.add_argument(
         '--max-tools',
         type=int,
-        default=50,
-        help='Maximum number of tool calls per attempt (default: 50)'
+        default=100,
+        help='Maximum number of tool calls per attempt (default: 100)'
     )
     parser.add_argument(
         '--verbose',

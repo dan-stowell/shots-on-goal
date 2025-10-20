@@ -90,7 +90,7 @@ Commonly used flags:
 | ---- | ----------- |
 | `--implementer-model` | LLM model identifier for implementation (default: `claude-sonnet-4.5`) |
 | `--image` | Container image used for tool execution (default: `shots-on-goal:latest`) |
-| `--max-tools` | Max tool calls before aborting an attempt (default: 50) |
+| `--max-tools` | Max tool calls before aborting an attempt (default: 100) |
 | `--validation` | Shell command(s) to verify success (can be repeated) |
 | `--verbose`, `-v` | Enable verbose (DEBUG) logging |
 
