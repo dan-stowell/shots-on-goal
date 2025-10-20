@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """
 Test suite for shots_on_goal.py
-Run with: python3 test_shots_on_goal.py
+
+Run fast tests only:
+    python3 test_shots_on_goal.py
+
+Run all tests including container tests:
+    RUN_CONTAINER_TESTS=1 python3 test_shots_on_goal.py
+
+Run specific test class:
+    python3 -m unittest test_shots_on_goal.TestDatabase
 """
 
+import os
 import unittest
 import tempfile
 import shutil
@@ -15,6 +24,9 @@ from unittest.mock import patch
 
 # Import functions from main module
 import shots_on_goal
+
+# Check if container tests should run
+RUN_CONTAINER_TESTS = os.environ.get('RUN_CONTAINER_TESTS', '0') == '1'
 
 
 class TestDatabase(unittest.TestCase):
@@ -547,6 +559,7 @@ class TestGitManager(unittest.TestCase):
         self.assertIn('refs/heads/goal-1-attempt-2', worktree_branches)
 
 
+@unittest.skipUnless(RUN_CONTAINER_TESTS, "Skipping container tests (set RUN_CONTAINER_TESTS=1 to run)")
 class TestContainerManager(unittest.TestCase):
     """Test container management"""
 
@@ -647,6 +660,7 @@ class TestContainerManager(unittest.TestCase):
             container.exec("echo hello")
 
 
+@unittest.skipUnless(RUN_CONTAINER_TESTS, "Skipping container tests (set RUN_CONTAINER_TESTS=1 to run)")
 class TestToolExecutor(unittest.TestCase):
     """Test tool execution in containers"""
 
@@ -819,6 +833,7 @@ class TestToolExecutor(unittest.TestCase):
         self.assertIsNotNone(result['stderr'])
 
 
+@unittest.skipUnless(RUN_CONTAINER_TESTS, "Skipping container tests (set RUN_CONTAINER_TESTS=1 to run)")
 class TestWorkOnGoal(unittest.TestCase):
     """Test the work_on_goal function (end-to-end)"""
 
