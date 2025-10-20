@@ -136,6 +136,7 @@ def init_database_v2(db_path):
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS session (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             initial_goal TEXT NOT NULL,
             model_a TEXT NOT NULL,
@@ -320,14 +321,14 @@ def init_database_v2(db_path):
 # Database Helper Functions V2
 # ============================================================================
 
-def create_session_v2(db, initial_goal, model_a, model_b, flags, repo_path, base_branch):
+def create_session_v2(db, name, initial_goal, model_a, model_b, flags, repo_path, base_branch):
     """Create a session record in V2 schema."""
     cursor = db.execute(
         """
-        INSERT INTO session (initial_goal, model_a, model_b, flags, repo_path, base_branch)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO session (name, initial_goal, model_a, model_b, flags, repo_path, base_branch)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (initial_goal, model_a, model_b, json.dumps(flags), repo_path, base_branch)
+        (name, initial_goal, model_a, model_b, json.dumps(flags), repo_path, base_branch)
     )
     db.commit()
     return cursor.lastrowid
@@ -1385,8 +1386,9 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
 
     logging.info(f"Working on goal {goal_id}: {goal['goal_text'][:60]}")
 
-    # Get or create persistent goal branch: s{session}-g{goal}
-    goal_branch_name = f"s{session_id}-g{goal_id}"
+    # Get or create persistent goal branch using session name
+    session_name = session['name']
+    goal_branch_name = f"{session_name}-g{goal_id}"
 
     # Check if goal branch exists in git
     check_branch = subprocess.run(
@@ -1437,7 +1439,7 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
 
     # Create unique attempt branch name (includes timestamp)
     timestamp = int(time.time())
-    attempt_branch_name = f"s{session_id}-g{goal_id}-a{next_attempt_id}-{timestamp}"
+    attempt_branch_name = f"{session_name}-g{goal_id}-a{next_attempt_id}-{timestamp}"
 
     # Create attempt branch from goal branch
     attempt_branch_id = create_branch_v2(
@@ -1450,8 +1452,8 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
     )
     logging.info(f"Created attempt branch: {attempt_branch_name} from {goal_branch_name}")
 
-    # Create worktree path (globally unique: session + goal + attempt + timestamp)
-    worktree_path = f"{repo_path}/worktrees/s{session_id}-g{goal_id}-a{next_attempt_id}-{timestamp}"
+    # Create worktree path (globally unique: session name + goal + attempt + timestamp)
+    worktree_path = f"{repo_path}/worktrees/{session_name}-g{goal_id}-a{next_attempt_id}-{timestamp}"
 
     # Create git worktree with attempt branch
     os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
@@ -2371,15 +2373,19 @@ def main():
     )
     starting_sha = result.stdout.strip()[:8]  # First 8 chars of SHA
 
-    # Create V2 database with timestamp and SHA
-    timestamp = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
-    db_path = f"shots-on-goal-{timestamp}-{starting_sha}.db"
+    # Create session name with timestamp and SHA (branch-safe and file-safe)
+    timestamp = datetime.now().strftime('%Y-%m-%dT%H_%M_%S')
+    session_name = f"{timestamp}-{starting_sha}"
+
+    # Create V2 database with session name
+    db_path = f"shots-on-goal-{session_name}.db"
     db = init_database_v2(db_path)
     logging.info(f"Created database: {db_path}")
 
     # Create V2 session
     session_id = create_session_v2(
         db,
+        name=session_name,
         initial_goal=args.goal,
         model_a=args.implementer_model,
         model_b='unused',  # Schema requires NOT NULL, but no longer used
@@ -2387,7 +2393,7 @@ def main():
         repo_path=str(repo_path),
         base_branch=base_branch
     )
-    logging.info(f"Created V2 session (ID: {session_id})")
+    logging.info(f"Created session: {session_name} (ID: {session_id})")
 
     # Create tools in V2 schema
     tool_definitions = [
