@@ -1372,7 +1372,7 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
     if not goal or not session:
         raise ValueError("Goal or session not found")
 
-    logging.info(f"[V2] Working on goal {goal_id}: {goal['goal_text'][:60]}")
+    logging.info(f"Working on goal {goal_id}: {goal['goal_text'][:60]}")
 
     # Get or create persistent goal branch: s{session}-g{goal}
     goal_branch_name = f"s{session_id}-g{goal_id}"
@@ -1387,7 +1387,7 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
 
     if check_branch.returncode == 0:
         # Goal branch exists - use its current HEAD
-        logging.info(f"[V2] Using existing goal branch: {goal_branch_name}")
+        logging.info(f"Using existing goal branch: {goal_branch_name}")
         goal_branch_sha = check_branch.stdout.strip()
     else:
         # Create new goal branch from session base branch
@@ -1407,7 +1407,7 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
             check=True,
             capture_output=True
         )
-        logging.info(f"[V2] Created new goal branch: {goal_branch_name} from {base_branch}")
+        logging.info(f"Created new goal branch: {goal_branch_name} from {base_branch}")
         goal_branch_sha = base_sha
 
         # Track goal branch in database
@@ -1437,7 +1437,7 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
         reason=f"Attempt for goal {goal_id}",
         created_by_goal_id=goal_id
     )
-    logging.info(f"[V2] Created attempt branch: {attempt_branch_name} from {goal_branch_name}")
+    logging.info(f"Created attempt branch: {attempt_branch_name} from {goal_branch_name}")
 
     # Create worktree path (globally unique: session + goal + attempt + timestamp)
     worktree_path = f"{repo_path}/worktrees/s{session_id}-g{goal_id}-a{next_attempt_id}-{timestamp}"
@@ -1450,7 +1450,7 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
         check=True,
         capture_output=True
     )
-    logging.info(f"[V2] Created git worktree: {worktree_path} (branch: {attempt_branch_name})")
+    logging.info(f"Created git worktree: {worktree_path} (branch: {attempt_branch_name})")
 
     # Configure git for commits (defensive - may already be set)
     subprocess.run(
@@ -1484,7 +1484,7 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
         model=model_id,
         attempt_type=attempt_type
     )
-    logging.info(f"[V2] Created attempt {attempt_id} with {model_id}")
+    logging.info(f"Created attempt {attempt_id} with {model_id}")
 
     # Get tools for this session and link to attempt
     tools_list = get_tools_for_session_v2(db, session_id)
@@ -1492,12 +1492,12 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
     for tool in tools_list:
         create_attempt_tool_v2(db, attempt_id, tool['id'])
         tool_id_map[tool['name']] = tool['id']
-    logging.debug(f"[V2] Linked {len(tools_list)} tools to attempt")
+    logging.debug(f"Linked {len(tools_list)} tools to attempt")
 
     # Create container for isolated execution
     container = ContainerManager(image=image, runtime=runtime)
     container_id = container.start(worktree_path)
-    logging.info(f"[V2] Started container {container_id[:12]}")
+    logging.info(f"Started container {container_id[:12]}")
 
     try:
         # Initialize tool executor and create tool functions
@@ -1513,7 +1513,7 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
             # Check timeout (2 minutes)
             elapsed = time.time() - last_activity_time[0]
             if elapsed > 120:
-                logging.error(f"[V2 Attempt {attempt_id}] Timeout: No activity for {elapsed:.1f}s")
+                logging.error(f"Attempt {attempt_id} timeout: No activity for {elapsed:.1f}s")
                 raise LLMTimeoutError(f"No activity for {elapsed:.1f}s (timeout: 120s)")
 
             last_activity_time[0] = time.time()
@@ -1523,7 +1523,7 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
 
             # Log
             args_str = str(tool_call.arguments)[:100]
-            logging.info(f"[V2]   Tool {len(tool_calls_made)+1}/{max_tools}: {tool_name}({args_str})")
+            logging.info(f"  Tool {len(tool_calls_made)+1}/{max_tools}: {tool_name}({args_str})")
 
             # Record tool call
             tool_id = tool_id_map.get(tool_name)
@@ -1538,12 +1538,12 @@ def work_on_goal_v2_simple(db, session_id, goal_id, repo_path, model_id,
 
             # Check tool limit
             if len(tool_calls_made) >= max_tools:
-                logging.warning(f"[V2 Attempt {attempt_id}] Tool limit ({max_tools}) reached")
+                logging.warning(f"Attempt {attempt_id} tool limit ({max_tools}) reached")
                 raise ToolLimitExceeded(f"Tool limit of {max_tools} exceeded")
 
         try:
             # Call LLM with tools
-            logging.info(f"[V2] Calling LLM {model_id}...")
+            logging.info(f"Calling LLM {model_id}...")
             model = llm.get_model(model_id)
 
             # Get validation steps to include in prompt
@@ -1583,7 +1583,7 @@ When you have successfully achieved the goal (or determined it cannot be achieve
             )
 
             response_text = chain.text()
-            logging.info(f"[V2] LLM completed - {len(tool_calls_made)} tools used")
+            logging.info(f"LLM completed - {len(tool_calls_made)} tools used")
 
             # Check for uncommitted changes
             status_result = subprocess.run(
@@ -1597,10 +1597,10 @@ When you have successfully achieved the goal (or determined it cannot be achieve
 
             if has_changes:
                 # Commit all changes
-                logging.info(f"[V2] Committing changes made by LLM...")
+                logging.info(f"Committing changes made by LLM...")
                 subprocess.run(['git', 'add', '-A'], cwd=worktree_path, check=True, capture_output=True)
 
-                commit_msg = f"""[V2] Goal {goal_id}: {goal['goal_text']}
+                commit_msg = f"""Goal {goal_id}: {goal['goal_text']}
 
 Attempt {attempt_id} by {model_id}
 
@@ -1613,9 +1613,9 @@ Prompt sent to LLM:
                     check=True,
                     capture_output=True
                 )
-                logging.info(f"[V2] Changes committed")
+                logging.info(f"Changes committed")
             else:
-                logging.info(f"[V2] No changes to commit")
+                logging.info(f"No changes to commit")
 
             # Get final commit SHA
             result = subprocess.run(
@@ -1640,19 +1640,19 @@ Prompt sent to LLM:
             status_detail = f"Used {len(tool_calls_made)} tools"
 
         except LLMTimeoutError as e:
-            logging.error(f"[V2] Timeout: {e}")
+            logging.error(f"Timeout: {e}")
             end_sha = goal_branch_sha
             diff = ""
             status = "timeout"
             status_detail = str(e)
         except ToolLimitExceeded as e:
-            logging.error(f"[V2] Tool limit exceeded: {e}")
+            logging.error(f"Tool limit exceeded: {e}")
             end_sha = goal_branch_sha
             diff = ""
             status = "tool_limit"
             status_detail = str(e)
         except Exception as e:
-            logging.error(f"[V2] Error: {e}")
+            logging.error(f"Error: {e}")
             end_sha = goal_branch_sha
             diff = ""
             status = "error"
@@ -1665,14 +1665,14 @@ Prompt sent to LLM:
     result_id = create_attempt_result_v2(
         db, attempt_id, end_sha, diff, status, status_detail
     )
-    logging.info(f"[V2] Created attempt result {result_id}: {status}")
+    logging.info(f"Created attempt result {result_id}: {status}")
 
     # Run validation if goal has validation steps (use container for consistency)
     validation_steps = get_validation_steps_v2(db, goal_id)
     validation_passed = None
 
     if validation_steps:
-        logging.info(f"[V2] Running {len(validation_steps)} validation steps in container")
+        logging.info(f"Running {len(validation_steps)} validation steps in container")
         all_passed = True
 
         # Restart container for validation (it may have been stopped)
@@ -1687,11 +1687,11 @@ Prompt sent to LLM:
             if check_result.returncode != 0 or check_result.stdout.strip() != 'true':
                 container_id = container.start(worktree_path)
                 container_restarted = True
-                logging.info(f"[V2] Restarted container for validation")
+                logging.info(f"Restarted container for validation")
         except:
             container_id = container.start(worktree_path)
             container_restarted = True
-            logging.info(f"[V2] Started new container for validation")
+            logging.info(f"Started new container for validation")
 
         for step in validation_steps:
             # Execute validation command in container
@@ -1707,15 +1707,15 @@ Prompt sent to LLM:
 
             if val_result.returncode != 0:
                 all_passed = False
-                logging.warning(f"[V2]   Validation FAILED: {step['command']}")
+                logging.warning(f"  Validation FAILED: {step['command']}")
             else:
-                logging.info(f"[V2]   Validation passed: {step['command']}")
+                logging.info(f"  Validation passed: {step['command']}")
 
         if container_restarted:
             container.stop()
 
         validation_passed = all_passed
-        logging.info(f"[V2] Validation: {'PASSED' if validation_passed else 'FAILED'}")
+        logging.info(f"Validation: {'PASSED' if validation_passed else 'FAILED'}")
 
         # Update status to "success" if validation passed
         if validation_passed and status == "completed":
@@ -1726,12 +1726,12 @@ Prompt sent to LLM:
                 (status, result_id)
             )
             db.commit()
-            logging.info(f"[V2] Updated result status to 'success'")
+            logging.info(f"Updated result status to 'success'")
 
     # Merge attempt branch into goal branch on success
     if status == "success" and validation_passed:
         try:
-            logging.info(f"[V2] Merging {attempt_branch_name} into {goal_branch_name}")
+            logging.info(f"Merging {attempt_branch_name} into {goal_branch_name}")
 
             # Checkout goal branch in main repo
             subprocess.run(
@@ -1758,7 +1758,7 @@ Prompt sent to LLM:
                 check=True
             )
             merge_commit_sha = merge_result.stdout.strip()
-            logging.info(f"[V2] ✓ Merged successfully (commit: {merge_commit_sha[:8]})")
+            logging.info(f"✓ Merged successfully (commit: {merge_commit_sha[:8]})")
 
             # Record merge in database
             # Get branch IDs
@@ -1777,25 +1777,25 @@ Prompt sent to LLM:
                     to_commit_sha=goal_branch_sha,
                     result_commit_sha=merge_commit_sha
                 )
-                logging.info(f"[V2] Recorded merge in database")
+                logging.info(f"Recorded merge in database")
 
         except subprocess.CalledProcessError as e:
-            logging.error(f"[V2] Failed to merge: {e}")
+            logging.error(f"Failed to merge: {e}")
             status = "error"
             # Don't fail the entire attempt, just log the error
 
     # Cleanup: remove worktree
     try:
-        logging.info(f"[V2] Cleaning up worktree: {worktree_path}")
+        logging.info(f"Cleaning up worktree: {worktree_path}")
         subprocess.run(
             ['git', 'worktree', 'remove', worktree_path, '--force'],
             cwd=repo_path,
             check=True,
             capture_output=True
         )
-        logging.info(f"[V2] ✓ Worktree removed")
+        logging.info(f"✓ Worktree removed")
     except subprocess.CalledProcessError as e:
-        logging.warning(f"[V2] Failed to remove worktree: {e}")
+        logging.warning(f"Failed to remove worktree: {e}")
 
     success = (status == "success") and (validation_passed is True)
 
