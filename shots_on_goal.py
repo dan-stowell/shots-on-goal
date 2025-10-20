@@ -2361,8 +2361,19 @@ def main():
     logging.info("Shots on Goal - Autonomous Code Migration")
     logging.info("=" * 80)
 
-    # Create V2 database
-    db_path = f"shots-on-goal-v2-{int(time.time())}.db"
+    # Get starting git SHA
+    result = subprocess.run(
+        ['git', 'rev-parse', 'HEAD'],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        check=True
+    )
+    starting_sha = result.stdout.strip()[:8]  # First 8 chars of SHA
+
+    # Create V2 database with timestamp and SHA
+    timestamp = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+    db_path = f"shots-on-goal-{timestamp}-{starting_sha}.db"
     db = init_database_v2(db_path)
     logging.info(f"Created database: {db_path}")
 
