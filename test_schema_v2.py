@@ -80,6 +80,7 @@ class SchemaV2TestCase(unittest.TestCase):
     def test_session_crud(self):
         session_id = create_session_v2(
             self.db,
+            name="test-session",
             initial_goal="Test goal",
             model_a="model-a",
             model_b="model-b",
@@ -96,7 +97,7 @@ class SchemaV2TestCase(unittest.TestCase):
         self.assertLess((datetime.now() - ts).total_seconds(), 5)
 
     def test_tool_crud(self):
-        session_id = create_session_v2(self.db, "Test", "a", "b", {}, "/tmp", "main")
+        session_id = create_session_v2(self.db, "test-session", "Test", "a", "b", {}, "/tmp", "main")
         tool_id = create_tool_v2(self.db, session_id, "read_file", "Read a file")
         tool = get_tool_v2(self.db, tool_id)
         self.assertEqual(tool['name'], "read_file")
@@ -104,7 +105,7 @@ class SchemaV2TestCase(unittest.TestCase):
         self.assertEqual(len(tools), 1)
 
     def test_goal_hierarchy(self):
-        session_id = create_session_v2(self.db, "Test", "a", "b", {}, "/tmp", "main")
+        session_id = create_session_v2(self.db, "test-session", "Test", "a", "b", {}, "/tmp", "main")
         parent = create_goal_v2(self.db, session_id, "Parent", source='cli')
         create_goal_v2(self.db, session_id, "Child 1", parent_goal_id=parent, order_num=1, source='breakdown')
         create_goal_v2(self.db, session_id, "Child 2", parent_goal_id=parent, order_num=2, source='breakdown')
@@ -112,14 +113,14 @@ class SchemaV2TestCase(unittest.TestCase):
         self.assertEqual([c['goal_text'] for c in children], ["Child 1", "Child 2"])
 
     def test_validation_steps(self):
-        session_id = create_session_v2(self.db, "Test", "a", "b", {}, "/tmp", "main")
+        session_id = create_session_v2(self.db, "test-session", "Test", "a", "b", {}, "/tmp", "main")
         goal_id = create_goal_v2(self.db, session_id, "Goal")
         create_validation_step_v2(self.db, goal_id, 1, "bazel build //...")
         steps = get_validation_steps_v2(self.db, goal_id)
         self.assertEqual(len(steps), 1)
 
     def test_branch_and_worktree(self):
-        session_id = create_session_v2(self.db, "Test", "a", "b", {}, "/tmp", "main")
+        session_id = create_session_v2(self.db, "test-session", "Test", "a", "b", {}, "/tmp", "main")
         goal_id = create_goal_v2(self.db, session_id, "Goal")
         branch_id = create_branch_v2(self.db, session_id, "feature", created_by_goal_id=goal_id)
         worktree_id = create_worktree_v2(self.db, branch_id, "/tmp/wt", "abc123")
@@ -129,7 +130,7 @@ class SchemaV2TestCase(unittest.TestCase):
         self.assertEqual(worktree['start_sha'], "abc123")
 
     def test_attempt_lifecycle(self):
-        session_id = create_session_v2(self.db, "Test", "a", "b", {}, "/tmp", "main")
+        session_id = create_session_v2(self.db, "test-session", "Test", "a", "b", {}, "/tmp", "main")
         goal_id = create_goal_v2(self.db, session_id, "Goal")
         branch_id = create_branch_v2(self.db, session_id, "feature", created_by_goal_id=goal_id)
         worktree_id = create_worktree_v2(self.db, branch_id, "/tmp/wt", "abc123")
@@ -141,7 +142,7 @@ class SchemaV2TestCase(unittest.TestCase):
         self.assertEqual(result['status'], "success")
 
     def test_tool_calls_and_validation_runs(self):
-        session_id = create_session_v2(self.db, "Test", "a", "b", {}, "/tmp", "main")
+        session_id = create_session_v2(self.db, "test-session", "Test", "a", "b", {}, "/tmp", "main")
         tool_id = create_tool_v2(self.db, session_id, "read_file", "")
         goal_id = create_goal_v2(self.db, session_id, "Goal")
         branch_id = create_branch_v2(self.db, session_id, "feature", created_by_goal_id=goal_id)
@@ -158,7 +159,7 @@ class SchemaV2TestCase(unittest.TestCase):
         self.assertEqual(len(runs), 1)
 
     def test_merge_crud(self):
-        session_id = create_session_v2(self.db, "Test", "a", "b", {}, "/tmp", "main")
+        session_id = create_session_v2(self.db, "test-session", "Test", "a", "b", {}, "/tmp", "main")
         goal_id = create_goal_v2(self.db, session_id, "Goal")
         from_branch = create_branch_v2(self.db, session_id, "feature", created_by_goal_id=goal_id)
         to_branch = create_branch_v2(self.db, session_id, "main", created_by_goal_id=goal_id)
@@ -168,7 +169,7 @@ class SchemaV2TestCase(unittest.TestCase):
 
     def test_get_goal_with_attempts(self):
         """Test getting goal with all attempts."""
-        session_id = create_session_v2(self.db, "Test", "a", "b", {}, "/tmp", "main")
+        session_id = create_session_v2(self.db, "test-session", "Test", "a", "b", {}, "/tmp", "main")
         goal_id = create_goal_v2(self.db, session_id, "Goal")
         branch_id = create_branch_v2(self.db, session_id, "feature", created_by_goal_id=goal_id)
         wt1 = create_worktree_v2(self.db, branch_id, "/tmp/wt1", "abc")
@@ -191,7 +192,7 @@ class SchemaV2TestCase(unittest.TestCase):
 
     def test_get_attempt_with_details(self):
         """Test getting attempt with all related data."""
-        session_id = create_session_v2(self.db, "Test", "a", "b", {}, "/tmp", "main")
+        session_id = create_session_v2(self.db, "test-session", "Test", "a", "b", {}, "/tmp", "main")
         tool_id = create_tool_v2(self.db, session_id, "read_file", "")
         goal_id = create_goal_v2(self.db, session_id, "Goal")
         branch_id = create_branch_v2(self.db, session_id, "feature", created_by_goal_id=goal_id)
@@ -217,7 +218,7 @@ class SchemaV2TestCase(unittest.TestCase):
 
     def test_get_goal_tree(self):
         """Test getting goal hierarchy recursively."""
-        session_id = create_session_v2(self.db, "Test", "a", "b", {}, "/tmp", "main")
+        session_id = create_session_v2(self.db, "test-session", "Test", "a", "b", {}, "/tmp", "main")
 
         # Create hierarchy: root -> child1, child2 -> grandchild1
         root = create_goal_v2(self.db, session_id, "Root")
@@ -236,7 +237,7 @@ class SchemaV2TestCase(unittest.TestCase):
 
     def test_get_validation_status(self):
         """Test checking validation status."""
-        session_id = create_session_v2(self.db, "Test", "a", "b", {}, "/tmp", "main")
+        session_id = create_session_v2(self.db, "test-session", "Test", "a", "b", {}, "/tmp", "main")
         goal_id = create_goal_v2(self.db, session_id, "Goal")
 
         # Create validation steps
@@ -264,7 +265,7 @@ class SchemaV2TestCase(unittest.TestCase):
 
     def test_get_goal_ancestry(self):
         """Test getting goal ancestry chain."""
-        session_id = create_session_v2(self.db, "Test", "a", "b", {}, "/tmp", "main")
+        session_id = create_session_v2(self.db, "test-session", "Test", "a", "b", {}, "/tmp", "main")
 
         # Create chain: root -> parent -> child
         root = create_goal_v2(self.db, session_id, "Root")
@@ -280,7 +281,7 @@ class SchemaV2TestCase(unittest.TestCase):
 
     def test_get_attempts_summary(self):
         """Test getting summary statistics for attempts."""
-        session_id = create_session_v2(self.db, "Test", "a", "b", {}, "/tmp", "main")
+        session_id = create_session_v2(self.db, "test-session", "Test", "a", "b", {}, "/tmp", "main")
         tool_id = create_tool_v2(self.db, session_id, "read_file", "")
         goal_id = create_goal_v2(self.db, session_id, "Goal")
         branch_id = create_branch_v2(self.db, session_id, "feature", created_by_goal_id=goal_id)
@@ -325,7 +326,7 @@ class SchemaV2TestCase(unittest.TestCase):
             subprocess.run(['git', 'commit', '-m', 'Initial commit'], cwd=tmpdir, check=True, capture_output=True)
 
             # Create session and goal
-            session_id = create_session_v2(self.db, "Test goal", "model-a", "model-b", {}, tmpdir, "main")
+            session_id = create_session_v2(self.db, "test-session", "Test goal", "model-a", "model-b", {}, tmpdir, "main")
 
             # Create some tools
             tool1 = create_tool_v2(self.db, session_id, "read_file", "Read a file")
