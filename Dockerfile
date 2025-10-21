@@ -25,15 +25,12 @@ RUN curl -Lo /usr/local/bin/bazel \
 # Verify installations
 RUN bazel --version && rg --version
 
-# Copy Bazel configuration to enforce bzlmod
-COPY shots-on-goal.bazelrc /root/.bazelrc
-
 # Create workspace directory
 WORKDIR /workspace
 
 # Set git config to avoid warnings
-RUN git config --global user.email "shots-on-goal@example.com" \
-    && git config --global user.name "Shots on Goal"
+RUN git config --global user.email "dan+shots-on-goal@buildbuddy.io" \
+    && git config --global user.name "shots-on-goal"
 
 # Keep container running by default
 CMD ["sleep", "infinity"]
