@@ -30,6 +30,3 @@ $RUNTIME run --rm ${IMAGE_NAME}:${IMAGE_TAG} rg --version
 
 echo ""
 echo "Successfully built ${IMAGE_NAME}:${IMAGE_TAG}"
-echo ""
-echo "To use this image with shots_on_goal.py, specify it with --image flag:"
-echo "  python3 shots_on_goal.py --image ${IMAGE_NAME}:${IMAGE_TAG} \"goal\" /path/to/repo"
