@@ -111,6 +111,8 @@ def _log_after_call(tool, tool_call, tool_result):
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     args = parse_args()
     container_id = None
 
