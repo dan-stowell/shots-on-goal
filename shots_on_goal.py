@@ -61,10 +61,10 @@ class ContainerToolbox(llm.Toolbox):
     def __init__(self, container_id: str):
         self.container_id = container_id
 
-    def _exec(self, *command: str) -> str:
-        logger.info("Executing tool command: %s", " ".join(command))
+    def _exec(self, command_and_args: tuple[str, ...]) -> str:
+        logger.info("Executing tool command: %s", " ".join(command_and_args))
         result = subprocess.run(
-            ("container", "exec", self.container_id) + command,
+            ("container", "exec", self.container_id) + command_and_args,
             capture_output=True,
             text=True,
         )
@@ -72,32 +72,32 @@ class ContainerToolbox(llm.Toolbox):
             error = result.stderr.strip() or result.stdout.strip()
             raise RuntimeError(error)
         output = result.stdout
-        logger.info("Tool command succeeded: %s", " ".join(command))
+        logger.info("Tool command succeeded: %s", " ".join(command_and_args))
         return output
 
-    def ls(self, *args: str) -> str:
+    def ls(self, args: tuple[str, ...]) -> str:
         """
         Run `ls` with the input args.
         """
-        return self._exec("ls", *args)
+        return self._exec(("ls",) + args)
 
-    def cat(self, *paths: str) -> str:
+    def cat(self, paths: tuple[str, ...]) -> str:
         """
         `cat` all the input paths.
         """
-        return self._exec("cat", *paths)
+        return self._exec(("cat",) + paths)
 
-    def find(self, *args: str) -> str:
+    def find(self, args: tuple[str, ...]) -> str:
         """
         Run `find` with the input args.
         """
-        return self._exec("find", *args)
+        return self._exec(("find",) + args)
 
-    def ripgrep(self, *args: str) -> str:
+    def rg(self, args: tuple[str, ...]) -> str:
         """
-        Run `ripgrep` with the input args.
+        Run `rg` with the input args.
         """
-        return self._exec("rg", *args)
+        return self._exec(("rg",) + args)
 
 
 def _log_before_call(tool, tool_call):
