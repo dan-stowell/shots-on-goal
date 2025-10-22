@@ -9,6 +9,11 @@ import llm
 logger = logging.getLogger(__name__)
 
 
+def _preview(value: object, limit: int = 80) -> str:
+    text = str(value)
+    return text if len(text) <= limit else f"{text[:limit]}..."
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", default="openrouter/z-ai/glm-4.5-air", help="model to use")
@@ -107,14 +112,15 @@ def _log_before_call(tool, tool_call):
 
 def _log_after_call(tool, tool_call, tool_result):
     tool_name = getattr(tool, "name", getattr(tool, "__name__", "unknown"))
-    logger.info("After tool call: %s result=%s", tool_name, tool_result.output)
+    logger.info("After tool call: %s result=%s", tool_name, _preview(tool_result.output))
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     args = parse_args()
-    logger.info("Parsed args: %s", args)
+    for key, value in vars(args).items():
+        logger.info("Arg %s: %s", key, value)
     container_id = None
 
     try:
@@ -127,9 +133,10 @@ def main():
             before_call=_log_before_call,
             after_call=_log_after_call,
         )
-        logger.info("Prompt: %s", args.prompt)
+        logger.info("Prompt: %s", _preview(args.prompt))
         response = conversation.chain(args.prompt).text()
-        logger.info("Model response: %s", response)
+        logger.info("Model response: %s", _preview(response))
+        print(response)
     except Exception as exc:
         logger.error("Error: %s", exc)
         raise
