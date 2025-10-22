@@ -121,7 +121,7 @@ def main():
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     args = parse_args()
     for key, value in vars(args).items():
-        logger.info("Arg %s: %s", key, value)
+        logger.info("Arg %s: %s", key, _preview(value))
     container_id = None
 
     try:
