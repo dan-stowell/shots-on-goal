@@ -112,7 +112,8 @@ def _log_before_call(tool, tool_call):
 
 def _log_after_call(tool, tool_call, tool_result):
     tool_name = getattr(tool, "name", getattr(tool, "__name__", "unknown"))
-    logger.info("After tool call: %s result=%s", tool_name, _preview(tool_result.output))
+    preview = _preview(tool_result.output)
+    logger.info("After tool call: %s result=%r", tool_name, preview)
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -133,9 +134,9 @@ def main():
             before_call=_log_before_call,
             after_call=_log_after_call,
         )
-        logger.info("Prompt: %s", _preview(args.prompt))
+        logger.info("Prompt: %r", _preview(args.prompt))
         response = conversation.chain(args.prompt).text()
-        logger.info("Model response: %s", _preview(response))
+        logger.info("Model response: %r", _preview(response))
         print(response)
     except Exception as exc:
         logger.error("Error: %s", exc)
