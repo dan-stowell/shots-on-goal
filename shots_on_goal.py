@@ -1,8 +1,12 @@
 import argparse
+import logging
 import os
 import subprocess
 
 import llm
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -18,6 +22,7 @@ def parse_args():
 
 
 def start_container(image: str, workdir: str) -> str:
+    logger.info("Starting container from image '%s' with workdir '%s'", image, workdir)
     result = subprocess.run(
         (
             "container",
@@ -36,11 +41,14 @@ def start_container(image: str, workdir: str) -> str:
         text=True,
         check=True,
     )
-    return result.stdout.strip()
+    container_id = result.stdout.strip()
+    logger.info("Started container %s", container_id)
+    return container_id
 
 
 def stop_container(container_id: str) -> None:
     try:
+        logger.info("Stopping container %s", container_id)
         subprocess.run(
             ("container", "stop", container_id),
             check=True,
@@ -54,6 +62,7 @@ class ContainerToolbox(llm.Toolbox):
         self.container_id = container_id
 
     def _exec(self, *command: str) -> str:
+        logger.info("Executing tool command: %s", " ".join(command))
         result = subprocess.run(
             ("container", "exec", self.container_id) + command,
             capture_output=True,
@@ -62,7 +71,9 @@ class ContainerToolbox(llm.Toolbox):
         if result.returncode != 0:
             error = result.stderr.strip() or result.stdout.strip()
             raise RuntimeError(error)
-        return result.stdout
+        output = result.stdout
+        logger.info("Tool command succeeded: %s", " ".join(command))
+        return output
 
     def ls(self, *args: str) -> str:
         """
@@ -88,7 +99,18 @@ class ContainerToolbox(llm.Toolbox):
         """
         return self._exec("rg", *args)
 
+
+def _log_before_call(tool, tool_call):
+    tool_name = getattr(tool, "name", getattr(tool, "__name__", "unknown"))
+    logger.info("Before tool call: %s args=%s", tool_name, tool_call.arguments)
+
+
+def _log_after_call(tool, tool_call, tool_result):
+    tool_name = getattr(tool, "name", getattr(tool, "__name__", "unknown"))
+    logger.info("After tool call: %s result=%s", tool_name, tool_result.output)
+
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = parse_args()
     container_id = None
 
@@ -96,8 +118,15 @@ def main():
         container_id = start_container(args.image, args.workdir)
         toolbox = ContainerToolbox(container_id)
         model = llm.get_model(args.model_name)
-        conversation = model.conversation(tools=[toolbox], chain_limit=args.tool_call_limit)
+        conversation = model.conversation(
+            tools=[toolbox],
+            chain_limit=args.tool_call_limit,
+            before_call=_log_before_call,
+            after_call=_log_after_call,
+        )
+        logger.info("Prompt: %s", args.prompt)
         response = conversation.chain(args.prompt).text()
+        logger.info("Model response: %s", response)
         print(response)
     except Exception as exc:
         print(f"Error: {exc}")
