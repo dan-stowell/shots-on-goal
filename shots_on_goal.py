@@ -114,6 +114,7 @@ def main():
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     args = parse_args()
+    logger.info("Parsed args: %s", args)
     container_id = None
 
     try:
@@ -129,9 +130,8 @@ def main():
         logger.info("Prompt: %s", args.prompt)
         response = conversation.chain(args.prompt).text()
         logger.info("Model response: %s", response)
-        print(response)
     except Exception as exc:
-        print(f"Error: {exc}")
+        logger.error("Error: %s", exc)
         raise
     finally:
         if container_id:
