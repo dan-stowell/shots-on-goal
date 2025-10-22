@@ -1,7 +1,6 @@
 [project]
 name = "shots-on-goal"
 version = "0.1.0"
-description = "Autonomous goal-driven code migration system"
 requires-python = ">=3.9"
 dependencies = [
     "llm>=0.13",
