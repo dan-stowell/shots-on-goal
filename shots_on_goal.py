@@ -61,10 +61,10 @@ class ContainerToolbox(llm.Toolbox):
     def __init__(self, container_id: str):
         self.container_id = container_id
 
-    def _exec(self, command_and_args: tuple[str, ...]) -> str:
+    def _exec(self, command_and_args: list[str]) -> str:
         logger.info("Executing tool command: %s", " ".join(command_and_args))
         result = subprocess.run(
-            ("container", "exec", self.container_id) + command_and_args,
+            ("container", "exec", self.container_id) + tuple(command_and_args),
             capture_output=True,
             text=True,
         )
@@ -75,29 +75,29 @@ class ContainerToolbox(llm.Toolbox):
         logger.info("Tool command succeeded: %s", " ".join(command_and_args))
         return output
 
-    def ls(self, args: tuple[str, ...]) -> str:
+    def ls(self, args: list[str]) -> str:
         """
         Run `ls` with the input args.
         """
-        return self._exec(("ls",) + args)
+        return self._exec(["ls", *args])
 
-    def cat(self, paths: tuple[str, ...]) -> str:
+    def cat(self, paths: list[str]) -> str:
         """
         `cat` all the input paths.
         """
-        return self._exec(("cat",) + paths)
+        return self._exec(["cat", *paths])
 
-    def find(self, args: tuple[str, ...]) -> str:
+    def find(self, args: list[str]) -> str:
         """
         Run `find` with the input args.
         """
-        return self._exec(("find",) + args)
+        return self._exec(["find", *args])
 
-    def rg(self, args: tuple[str, ...]) -> str:
+    def rg(self, args: list[str]) -> str:
         """
         Run `rg` with the input args.
         """
-        return self._exec(("rg",) + args)
+        return self._exec(["rg", *args])
 
 
 def _log_before_call(tool, tool_call):
